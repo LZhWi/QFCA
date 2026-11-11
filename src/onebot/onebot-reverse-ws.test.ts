@@ -19,8 +19,8 @@ describe("OneBotReverseWsServer", () => {
   it.each([
     "127.0.0.1", "127.0.0.2", "127.255.255.254", "::1", "0:0:0:0:0:0:0:1",
     "::ffff:127.0.0.1", "::FFFF:7f00:0001", "0:0:0:0:0:ffff:7fff:fffe",
-  ])("accepts loopback literal %s with or without a token", (host) => {
-    for (const token of [undefined, "", "token"]) expect(() => validateListenAddress(host, 3001, token)).not.toThrow();
+  ])("accepts authenticated loopback literal %s", (host) => {
+    for (const token of ["token", "  existing-token  "]) expect(() => validateListenAddress(host, 3001, token)).not.toThrow();
   });
   it.each([
     "0.0.0.0", "::", "192.168.1.10", "172.28.64.1", "10.0.0.1", "169.254.1.1", "8.8.8.8",
@@ -40,7 +40,7 @@ describe("OneBotReverseWsServer", () => {
   });
   it("preserves port and raw token validation on loopback", () => {
     for (const port of [-1, 65536, 1.5, NaN]) expect(() => validateListenAddress("127.0.0.1", port)).toThrow("Invalid OneBot port");
-    for (const token of ["token\r", "\ntoken", "token\0", "t".repeat(4097)]) {
+    for (const token of ["token\r", "\ntoken", "token\0", "t".repeat(4097), " ".repeat(4096) + "t", null as unknown as string, 1 as unknown as string]) {
       expect(() => validateListenAddress("127.0.0.1", 3001, token)).toThrow("Invalid Access Token");
     }
   });
@@ -55,12 +55,65 @@ describe("OneBotReverseWsServer", () => {
       socket.terminate();
     },
   );
-  it("keeps token-free local connections available", async () => {
-    const value = server({ accessToken: "" });
+  it.each([undefined, "", " ", "\t", " \t ", "\u00a0", "\u3000", "\ufeff", "\u2002\u2028\u2029"])(
+    "rejects missing or whitespace-only tokens before opening a listener: %j", (accessToken) => {
+      expect(() => validateListenAddress("127.0.0.1", 3001, accessToken)).toThrow("nonempty Access Token");
+      expect(() => server({ accessToken })).toThrow("nonempty Access Token");
+    },
+  );
+  it("keeps legacy nonempty token trimming without rewriting the supplied credential", async () => {
+    const options = { host: "127.0.0.1", port: 0, accessToken: "  \t token \u00a0", expectedSelfId: "10001",
+      onClientConnected: () => undefined, onEvent: () => undefined };
+    const original = options.accessToken;
+    const value = new OneBotReverseWsServer(options); servers.push(value);
     const info = await value.start();
-    const socket = new WebSocket(info.url, { headers: { "X-Self-ID": "10001" } });
-    await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+    const socket = await connect(info.url);
+    expect(options.accessToken).toBe(original);
     socket.terminate();
+  });
+  it("revalidates empty tokens on queued start and restart without opening a listener", async () => {
+    const options = { host: "127.0.0.1", port: 0, accessToken: "token", expectedSelfId: "10001",
+      onClientConnected: () => undefined, onEvent: () => undefined };
+    const value = new OneBotReverseWsServer(options); servers.push(value);
+    const listen = vi.spyOn(http.Server.prototype, "listen");
+    try {
+      const pending = value.start(); options.accessToken = "";
+      await expect(pending).rejects.toThrow("nonempty Access Token");
+      expect(listen).not.toHaveBeenCalled(); expect(value.info).toBeNull();
+      options.accessToken = "token"; await value.start(); await value.stop(); listen.mockClear();
+      for (const token of ["", " \t ", "\u00a0\u3000"]) {
+        options.accessToken = token;
+        await expect(value.start()).rejects.toThrow("nonempty Access Token");
+        expect(listen).not.toHaveBeenCalled(); expect(value.info).toBeNull();
+      }
+      options.accessToken = "token";
+      const info = await value.start(); const socket = await connect(info.url); socket.terminate();
+    } finally { listen.mockRestore(); }
+  });
+  it("never downgrades a running listener or lets unauthenticated peers replace its client", async () => {
+    const connected = vi.fn(); const event = vi.fn();
+    const options = { host: "127.0.0.1", port: 0, accessToken: "token", expectedSelfId: "10001",
+      onClientConnected: connected, onEvent: event };
+    const value = new OneBotReverseWsServer(options); servers.push(value);
+    const info = await value.start(); const healthy = await connect(info.url);
+    await vi.waitFor(() => expect(connected).toHaveBeenCalledOnce());
+    const client = value.client;
+    options.accessToken = "";
+    expect(await value.start()).toEqual(info);
+    for (const authorization of [undefined, "Bearer ", "Bearer wrong", "Basic token", "token"]) {
+      const status = await new Promise<number>((resolve, reject) => {
+        const ws = new WebSocket(info.url, { headers: { "X-Self-ID": "10001",
+          ...(authorization === undefined ? {} : { Authorization: authorization }) } });
+        ws.on("open", () => { ws.terminate(); reject(new Error("Unauthenticated upgrade accepted")); });
+        ws.on("unexpected-response", (_req, res) => { resolve(res.statusCode!); res.resume(); ws.terminate(); });
+        ws.on("error", () => undefined);
+      });
+      expect(status).toBe(401); expect(value.client).toBe(client);
+    }
+    expect(connected).toHaveBeenCalledOnce();
+    healthy.send(JSON.stringify({ post_type: "message" }));
+    await vi.waitFor(() => expect(event).toHaveBeenCalledOnce());
+    healthy.terminate();
   });
   it("revalidates the exact bind inputs on queued start and restart", async () => {
     const options = { host: "127.0.0.1", port: 0, accessToken: "token", expectedSelfId: "10001",
