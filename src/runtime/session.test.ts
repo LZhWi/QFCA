@@ -221,6 +221,46 @@ async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolea
 }
 
 describe('NapCat media session', () => {
+  it('deduplicates media before downloading and preserves capacity for other transfers', async () => {
+    const f = await mediaFixture();
+    const message = f.message({ message: [{ type: 'image', data: { file: 'opaque-image' } }] });
+    f.socket.send(JSON.stringify(message));
+    // Queue duplicates while the first download can still be in flight; the
+    // trailing text event is a barrier proving all duplicates were processed.
+    for (let i = 0; i < 32; i++) f.socket.send(JSON.stringify(message));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5002 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(f.actions.filter((a) => a.action.startsWith('download_file_'))).toHaveLength(1);
+    const first = f.inbound[0]; const mediaId = first.attachments![0].mediaId;
+    expect(f.session.mediaRead({ connectionEpoch: 1, eventId: first.eventId, mediaId, offset: 0, limit: 65536 }).eof).toBe(true);
+    // The host still owns its first handle; all other 255 slots remain free.
+    const reservations = Array.from({ length: 255 }, (_, i) => f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: `capacity_${i}`, conversation: { type: 'private', peerId: '10002' }, media: { kind: 'file', size: 1 }, sha256: '0'.repeat(64) }));
+    for (const reservation of reservations) f.session.mediaRelease({ connectionEpoch: 1, ...reservation });
+    f.socket.send(JSON.stringify({ ...message, message_id: 5003 }));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(3));
+    expect(f.inbound[2].attachments).toHaveLength(1);
+    expect((await f.session.send(f.request())).outcome).toBe('sent');
+  });
+  it('does not let an invalid event reserve a media dedupe identity', async () => {
+    const f = await mediaFixture();
+    const message = f.message({ message: [{ type: 'image', data: { file: 'opaque-image' } }] });
+    f.socket.send(JSON.stringify({ ...message, sender: { user_id: 99999 } }));
+    f.socket.send(JSON.stringify(message));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    expect(f.inbound[0].attachments).toHaveLength(1);
+    expect(f.actions.filter((a) => a.action.startsWith('download_file_'))).toHaveLength(1);
+  });
+  it.each([
+    [{ type: 'private', peerId: '10002' }, { peerId: '10002', type: 'private' }, 'send_private_msg'],
+    [{ type: 'group', groupId: '20001' }, { groupId: '20001', type: 'group' }, 'send_group_msg'],
+  ] as const)('sends media with reordered conversation fields (%j)', async (conversation, reordered, action) => {
+    const { createHash } = await import('node:crypto'); const f = await mediaFixture();
+    const bytes = Buffer.from('send bytes'); const req = { ...f.request(), conversation };
+    const { mediaId } = f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: req.operationId, conversation, media: { kind: 'file', size: bytes.length }, sha256: createHash('sha256').update(bytes).digest('hex') });
+    f.session.mediaWrite({ connectionEpoch: 1, mediaId, offset: 0, data: bytes.toString('base64') });
+    expect((await f.session.send({ ...req, conversation: reordered, parts: [{ kind: 'file', mediaId }] })).outcome).toBe('sent');
+    expect(f.actions.filter((a) => a.action === action)).toHaveLength(1);
+  });
   it('probes without sends, downloads bounded media handles, preserves text and never exposes paths', async () => {
     const f = await mediaFixture();
     expect(f.actions.filter((a) => a.action.startsWith('send_'))).toHaveLength(0);

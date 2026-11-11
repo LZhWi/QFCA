@@ -51,6 +51,9 @@ export function recoverStaleSpools(): void {
 export const MEDIA_LIMITS = { fileBytes: 100 * 1024 * 1024, chunkBytes: 64 * 1024, totalBytes: 512 * 1024 * 1024, ttlMs: 300_000, handles: 256 } as const;
 export interface UploadBinding { connectionEpoch: number; operationId: string; conversation: QqConversation; media: Omit<QqMedia, 'mediaId'> & { size: number }; sha256: string }
 interface Entry { fd: number; path: string; expires: number; epoch: number; media: QqMedia; size: number; offset: number; readOffset: number; hash: Hash; expectedHash?: string; digest?: string; sealed: boolean; claimed: boolean; operationId?: string; conversation?: string; eventId?: string }
+function conversationKey(conversation: QqConversation): string {
+  return JSON.stringify([conversation.type, conversation.type === 'private' ? conversation.peerId : conversation.groupId]);
+}
 export function decodeChunk(data: unknown): Buffer {
   if (typeof data !== 'string' || data.length > Math.ceil(MEDIA_LIMITS.chunkBytes / 3) * 4 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) throw new Error('Invalid media chunk');
   const bytes = Buffer.from(data, 'base64');
@@ -86,7 +89,7 @@ export class MediaSpool {
   begin(binding: UploadBinding): { mediaId: string } {
     if (!/^[a-f0-9]{64}$/.test(binding.sha256)) throw new Error('Invalid media hash');
     const [mediaId, entry] = this.allocate(binding.connectionEpoch, binding.media);
-    entry.operationId = binding.operationId; entry.conversation = JSON.stringify(binding.conversation); entry.expectedHash = binding.sha256;
+    entry.operationId = binding.operationId; entry.conversation = conversationKey(binding.conversation); entry.expectedHash = binding.sha256;
     return { mediaId };
   }
   beginInbound(epoch: number, eventId: string, media: Omit<QqMedia, 'mediaId'> & { size: number }): QqMedia {
@@ -137,7 +140,7 @@ export class MediaSpool {
   }
   claim(binding: { connectionEpoch: number; operationId: string; conversation: QqConversation }, media: QqMedia): { size: number; read: (offset: number) => { data: string; eof: boolean } } {
     const entry = this.get(media.mediaId, binding.connectionEpoch);
-    if (!entry.sealed || entry.claimed || entry.eventId || entry.operationId !== binding.operationId || entry.conversation !== JSON.stringify(binding.conversation) || entry.media.kind !== media.kind || (media.size !== undefined && media.size !== entry.size)) throw new Error('Invalid media binding');
+    if (!entry.sealed || entry.claimed || entry.eventId || entry.operationId !== binding.operationId || entry.conversation !== conversationKey(binding.conversation) || entry.media.kind !== media.kind || (media.size !== undefined && media.size !== entry.size)) throw new Error('Invalid media binding');
     for (const key of ['filename', 'mime', 'caption'] as const) if (media[key] !== undefined && media[key] !== entry.media[key]) throw new Error('Invalid media metadata');
     entry.claimed = true;
     return { size: entry.size, read: (offset) => this.readEntry(this.get(media.mediaId, binding.connectionEpoch), offset, MEDIA_LIMITS.chunkBytes) };

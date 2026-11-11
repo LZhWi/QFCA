@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { QQ_CONTRACT_LIMITS, validateInboundMessage } from "../contract";
-import { isQqEventAllowed, messageMentionsSelf, normalizeOneBotMessage, splitQqText, textPayloads } from "./codec";
+import { isQqEventAllowed, messageMentionsSelf, normalizeOneBotMessage, oneBotMessageEventId, splitQqText, textPayloads } from "./codec";
 import type { OneBotNormalizerContext } from "./codec";
 import type { OneBotMessageEvent } from "./onebot-types";
 
@@ -168,6 +168,9 @@ describe("normalizeOneBotMessage", () => {
     const differentAccount = await normalizeOneBotMessage(event({ self_id: "8000" }), { ...ctx, selfId: "8000" });
     const differentMessage = await normalizeOneBotMessage(event({ message_id: "m-2" }), ctx);
     expect(original.eventId).toMatch(/^onebot_[a-f0-9]{64}$/);
+    // Pin the pre-media-review identity format so history dedupe stays stable.
+    expect(original.eventId).toBe('onebot_252ac179f3005f38727cd5722f442757c0b265e8d4d6532027828d43bf7d8546');
+    expect(oneBotMessageEventId(event(), ctx.selfId)).toBe(original.eventId);
     expect(repeat.eventId).toBe(original.eventId);
     expect(new Set([original, differentPeer, group, differentAccount, differentMessage].map((item) => item.eventId)).size).toBe(5);
   });

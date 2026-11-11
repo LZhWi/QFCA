@@ -7,6 +7,17 @@ function fixture(now?: () => number) { const spool = new MediaSpool(now); spools
 const bytes = Buffer.from('hello media');
 const binding = (extra: Partial<UploadBinding> = {}): UploadBinding => ({ connectionEpoch: 1, operationId: 'op', conversation: { type: 'private', peerId: '123' }, media: { kind: 'file', size: bytes.length }, sha256: createHash('sha256').update(bytes).digest('hex'), ...extra });
 describe('MediaSpool', () => {
+  it.each([
+    [{ type: 'private', peerId: '123' }, { peerId: '123', type: 'private' }, { type: 'private', peerId: '124' }],
+    [{ type: 'group', groupId: '123' }, { groupId: '123', type: 'group' }, { type: 'group', groupId: '124' }],
+  ] as const)('matches conversation fields independently of insertion order (%j)', (conversation, reordered, other) => {
+    const spool = fixture(); const b = binding({ conversation }); const { mediaId } = spool.begin(b);
+    spool.write(1, mediaId, 0, bytes.toString('base64'));
+    expect(() => spool.claim({ ...b, conversation: other }, { kind: 'file', mediaId })).toThrow();
+    expect(() => spool.claim({ ...b, conversation: conversation.type === 'private' ? { type: 'group', groupId: '123' } : { type: 'private', peerId: '123' } }, { kind: 'file', mediaId })).toThrow();
+    expect(spool.claim({ ...b, conversation: reordered }, { kind: 'file', mediaId }).read(0).data).toBe(bytes.toString('base64'));
+    expect(() => spool.claim(b, { kind: 'file', mediaId })).toThrow();
+  });
   it('seals hash-verified bytes, binds operation/conversation/kind/epoch and consumes once', () => {
     const spool = fixture(); const b = binding(); const { mediaId } = spool.begin(b);
     expect(() => spool.claim(b, { kind: 'file', mediaId })).toThrow();

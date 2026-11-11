@@ -82,6 +82,15 @@ function route(event: Record<string, unknown>): QqInboundMessageV1["conversation
   return invalid();
 }
 
+/** Stable identity only, shared by the early dedupe gate and full normalizer.
+ * Route objects are rebuilt in canonical order, preserving existing event IDs. */
+export function oneBotMessageEventId(event: OneBotMessageEvent, expectedSelfId: string): string {
+  if (!record(event)) invalid();
+  const selfId = id(expectedSelfId);
+  if (id(event.self_id) !== selfId) invalid();
+  return `onebot_${createHash("sha256").update(JSON.stringify([selfId, route(event), id(event.message_id)])).digest("hex")}`;
+}
+
 async function resolveMemberName(client: ActionClient, groupId: string, userId: string): Promise<string | undefined> {
   try {
     const data = await client.call<unknown>("get_group_member_info", { group_id: groupId, user_id: userId, no_cache: false });
@@ -167,7 +176,7 @@ export async function normalizeOneBotMessage(
   }
   // Validate every segment before making any enrichment calls.
   const message = segments(event.message);
-  const eventId = `onebot_${createHash("sha256").update(JSON.stringify([selfId, conversation, backendMessageId])).digest("hex")}`;
+  const eventId = oneBotMessageEventId(event, selfId);
   const attachments: QqMedia[] = [];
   const mentions: QqMention[] = [];
   const textParts: string[] = [];

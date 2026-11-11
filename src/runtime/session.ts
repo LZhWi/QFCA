@@ -10,7 +10,7 @@ import { probeMedia, uploadMedia, downloadMedia } from "../onebot/media";
 import { OneBotActionClient, OneBotActionError, OneBotTransportError } from "../onebot/onebot-action-client";
 import { OneBotReverseWsServer, type OneBotListeningInfo } from "../onebot/onebot-reverse-ws";
 import { isOneBotMessageEvent, oneBotId, type OneBotSegment } from "../onebot/onebot-types";
-import { isQqEventAllowed, normalizeOneBotMessage, splitQqText } from "../onebot/codec";
+import { isQqEventAllowed, normalizeOneBotMessage, oneBotMessageEventId, splitQqText } from "../onebot/codec";
 
 /** Fail-closed baseline; per-connection probes may enable NapCat media. */
 export const TEXT_CAPABILITIES: QqCapabilitySnapshot = {
@@ -144,6 +144,12 @@ export class QqOneBotSession {
     const generation = this.generation;
     const next = this.receiveChain.then(async () => {
       if (!this.accepting || generation !== this.generation || this.client !== client || this.server.client !== client) return;
+      const now = Date.now();
+      for (const [id, expires] of this.seen) if (expires <= now) this.seen.delete(id);
+      const eventId = oneBotMessageEventId(value, this.config.expectedSelfId);
+      // The receive chain is serial, so even duplicates queued during the first
+      // download are dropped before allocating any new media handles.
+      if (this.seen.has(eventId)) return;
       const message = await normalizeOneBotMessage(value, {
         selfId: this.config.expectedSelfId, connectionEpoch: epoch,
         configRevision: this.config.configRevision, client,
@@ -152,11 +158,8 @@ export class QqOneBotSession {
         }) } : {}),
       });
       if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) return;
-      const now = Date.now();
-      for (const [id, expires] of this.seen) if (expires <= now) this.seen.delete(id);
-      if (this.seen.has(message.eventId)) return;
       if (this.seen.size >= 4096) this.seen.delete(this.seen.keys().next().value!);
-      this.seen.set(message.eventId, now + 10 * 60_000);
+      this.seen.set(message.eventId, Date.now() + 10 * 60_000);
       await this.options.onInbound(message);
     });
     this.receiveChain = next.catch(() => undefined);
