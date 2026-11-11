@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { QQ_CONTRACT_LIMITS, validateInboundMessage } from "../contract";
 import { isQqEventAllowed, messageMentionsSelf, normalizeOneBotMessage, oneBotMessageEventId, splitQqText, textPayloads } from "./codec";
 import type { OneBotNormalizerContext } from "./codec";
@@ -30,8 +30,89 @@ function context(
 function unchecked(value: unknown): OneBotMessageEvent { return value as OneBotMessageEvent; }
 
 const policy = { allowedPrivateUserIds: ["1000"], allowedGroupIds: ["2000"], groupRequireMention: true };
+afterEach(() => vi.restoreAllMocks());
 
 describe("normalizeOneBotMessage", () => {
+  it("counts failed media downloads toward the per-message attempt limit", async () => {
+    const resolveMedia = vi.fn(async () => { throw new Error("unavailable"); });
+    const input = event({ message: [
+      { type: "text", data: { text: "keep this text" } },
+      ...Array.from({ length: 1023 }, (_, i) => ({ type: "image", data: { file: `image_${i}` } })),
+    ] });
+    const result = await normalizeOneBotMessage(input, context(undefined, { resolveMedia }));
+    expect(resolveMedia).toHaveBeenCalledTimes(QQ_CONTRACT_LIMITS.maxAttachments);
+    expect(result.text).toContain("keep this text");
+    expect(result.attachments).toBeUndefined();
+    expect(validateInboundMessage(result)).toBe(true);
+  });
+
+  it.each([false, true])("allows at most sixteen total mixed media attempts (failures: %s)", async (failures) => {
+    const kinds = ["image", "mface", "record", "file", "video"];
+    let count = 0;
+    const resolveMedia = vi.fn(async () => {
+      if (failures && ++count % 2 === 0) throw new Error("unavailable");
+      return { kind: "image" as const, mediaId: `handle_${count}` };
+    });
+    const result = await normalizeOneBotMessage(event({ message: Array.from({ length: 32 }, (_, i) => ({
+      type: kinds[i % kinds.length], data: { file: `file_${i}` },
+    })) }), context(undefined, { resolveMedia }));
+    expect(resolveMedia).toHaveBeenCalledTimes(16);
+    expect(result.attachments).toHaveLength(failures ? 8 : 16);
+    expect(validateInboundMessage(result)).toBe(true);
+  });
+
+  it("shares one monotonic deadline across media, member names and reply enrichment", async () => {
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const resolveMedia = vi.fn(async (_segment, _eventId, deadline: number) => {
+      expect(deadline).toBe(120_000);
+      if (clock + 50_000 >= deadline) { clock = deadline; throw new Error("media timeout"); }
+      clock += 50_000;
+      return { kind: "image" as const, mediaId: "kept_handle" };
+    });
+    const call = vi.fn(async (_action: string, _params: unknown, timeoutMs?: number) => {
+      clock += timeoutMs!;
+      throw new Error("backend timeout");
+    });
+    const result = await normalizeOneBotMessage(event({ message_type: "group", group_id: "2000", message: [
+      { type: "image", data: { file: "first" } },
+      { type: "at", data: { qq: "3000" } },
+      { type: "image", data: { file: "second" } },
+      { type: "reply", data: { id: "old-1" } },
+      { type: "at", data: { qq: "4000" } },
+      { type: "image", data: { file: "third" } },
+      { type: "text", data: { text: "preserved text" } },
+    ] }), context(undefined, { client: { call }, resolveMedia }));
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(call.mock.calls[0][2]).toBe(30_000);
+    expect(resolveMedia).toHaveBeenCalledTimes(2);
+    expect(result.reply).toEqual({ messageId: "old-1" });
+    expect(result.mentions).toEqual([{ userId: "3000" }, { userId: "4000" }]);
+    expect(result.text).toContain("[附件不可用:image]preserved text");
+    expect(result.attachments).toHaveLength(1);
+  });
+
+  it("caps metadata requests at the remaining budget and skips later media without losing text", async () => {
+    let clock = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    const call = vi.fn(async (_action: string, _params: unknown, timeoutMs?: number) => {
+      clock += timeoutMs!;
+      throw new Error("backend timeout");
+    });
+    const resolveMedia = vi.fn();
+    const result = await normalizeOneBotMessage(event({ message_type: "group", group_id: "2000", message: [
+      ...["3000", "4000", "5000", "6000", "7000"].map((qq) => ({ type: "at", data: { qq } })),
+      { type: "reply", data: { id: "old-1" } },
+      { type: "image", data: { file: "skipped" } },
+      { type: "text", data: { text: "preserved text" } },
+    ] }), context(undefined, { client: { call }, resolveMedia, normalizationBudgetMs: 75_000 }));
+    expect(call.mock.calls.map((args) => args[2])).toEqual([30_000, 30_000, 15_000]);
+    expect(resolveMedia).not.toHaveBeenCalled();
+    expect(result.reply).toEqual({ messageId: "old-1" });
+    expect(result.text).toContain("preserved text");
+    expect(validateInboundMessage(result)).toBe(true);
+  });
+
   it("preserves segment order, strips the first self mention, and expands one reply", async () => {
     const input = event({
       message_type: "group", group_id: "2000", sender: { user_id: "1000", nickname: "小明", card: "群名片" },
@@ -76,7 +157,7 @@ describe("normalizeOneBotMessage", () => {
       { userId: "9000", name: "机器人" }, { userId: "9000", name: "机器人" }, { userId: "all", name: "全体成员" },
     ]);
     expect(ctx.client.call).toHaveBeenCalledTimes(1);
-    expect(ctx.client.call).toHaveBeenCalledWith("get_group_member_info", { group_id: "2000", user_id: "9000", no_cache: false });
+    expect(ctx.client.call).toHaveBeenCalledWith("get_group_member_info", { group_id: "2000", user_id: "9000", no_cache: false }, 30_000);
     const nextContext = context(() => ({ nickname: "新账号昵称" }), { selfId: "8000" });
     const next = await normalizeOneBotMessage({ ...input, self_id: "8000" }, nextContext);
     expect(next.text).toContain("@新账号昵称");
@@ -146,7 +227,7 @@ describe("normalizeOneBotMessage", () => {
     const result = await normalizeOneBotMessage(input, ctx);
     expect(result.reply).toEqual({ messageId: "old-1", senderId: "4000", senderName: "引用者", text: "一层" });
     expect(ctx.client.call).toHaveBeenCalledTimes(1);
-    expect(ctx.client.call).toHaveBeenCalledWith("get_msg", { message_id: "old-1" });
+    expect(ctx.client.call).toHaveBeenCalledWith("get_msg", { message_id: "old-1" }, 30_000);
   });
 
   it.each([

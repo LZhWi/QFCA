@@ -8,7 +8,7 @@ export function opaqueBackendFileId(value: unknown): value is string {
   // A bare opaque token only. No URL, separators, dotted relative paths or schemes.
   return typeof value === 'string' && value.length <= 256 && /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(value);
 }
-const timeout = (deadline: number) => { const left = Math.floor(deadline - performance.now()); if (left < 1) throw new Error('Media timeout'); return Math.min(left, 30_000); };
+const timeout = (deadline: number, limit = 30_000) => { const left = Math.floor(deadline - performance.now()); if (left < 1) throw new Error('Media timeout'); return Math.min(left, limit); };
 /** Upload only bytes from our spool; backend-returned paths never cross IPC. */
 export async function uploadMedia(client: OneBotActionClient, source: { size: number; read(offset: number): { data: string; eof: boolean } }, check: () => void, deadline: number, extension = 'bin'): Promise<string> {
   const streamId = randomUUID();
@@ -60,16 +60,17 @@ export async function probeMedia(client: OneBotActionClient, base: QqCapabilityS
   } catch { /* Unsupported/failed probes safely retain text only. */ }
   return result;
 }
-export async function downloadMedia(client: OneBotActionClient, spool: MediaSpool, epoch: number, eventId: string, segment: OneBotSegment, check: () => void): Promise<QqMedia> {
+export async function downloadMedia(client: OneBotActionClient, spool: MediaSpool, epoch: number, eventId: string, segment: OneBotSegment, check: () => void, deadline = performance.now() + 120_000): Promise<QqMedia> {
   const fileId = segment.data.file_id ?? segment.data.file;
   if (!opaqueBackendFileId(fileId)) throw new Error('Invalid backend media ID');
   const kind = ({ image: 'image', mface: 'image', record: 'audio', file: 'file', video: 'video' } as Record<string, QqMedia['kind']>)[segment.type];
   if (!kind) throw new Error('Unsupported media');
   let media: QqMedia | undefined; let offset = 0; let index = 0;
   try {
+    check();
     const action = kind === 'image' ? 'download_file_image_stream' : kind === 'audio' ? 'download_file_record_stream' : 'download_file_stream';
     const terminal = await client.callStream<OneBotStreamPacket>(action, { file_id: fileId, chunk_size: MEDIA_LIMITS.chunkBytes, ...(kind === 'audio' ? { out_format: 'mp3' } : {}) }, (packet) => {
-      check();
+      check(); timeout(deadline, 120_000);
       if (packet.type === 'stream' && packet.data_type === 'file_info') {
         if (media || packet.chunk_size !== MEDIA_LIMITS.chunkBytes || !Number.isSafeInteger(packet.file_size) || packet.file_size! < 1 || packet.file_size! > MEDIA_LIMITS.fileBytes) throw new Error('Invalid media info');
         const filename = safeFilename(packet.file_name);
@@ -79,8 +80,8 @@ export async function downloadMedia(client: OneBotActionClient, spool: MediaSpoo
         if (!media || packet.index !== index || packet.size !== decodeChunk(packet.data).length) throw new Error('Invalid media chunk');
         spool.write(epoch, media.mediaId, offset, packet.data!, true); offset += packet.size; index++;
       } else if (packet.type !== 'response') throw new Error('Invalid media stream');
-    }, 120_000);
-    check();
+    }, timeout(deadline, 120_000));
+    check(); timeout(deadline, 120_000);
     if (!media || terminal.type !== 'response' || terminal.data_type !== 'file_complete' || terminal.total_bytes !== offset || terminal.total_chunks !== index || (kind !== 'audio' && offset !== media.size)) throw new Error('Incomplete media stream');
     return spool.finishInbound(epoch, media.mediaId, offset, terminal.sha256);
   } catch { if (media) { try { spool.release(epoch, media.mediaId); } catch { /* revoked */ } } throw new Error('Media unavailable'); }

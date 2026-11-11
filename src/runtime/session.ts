@@ -10,7 +10,7 @@ import { probeMedia, uploadMedia, downloadMedia } from "../onebot/media";
 import { OneBotActionClient, OneBotActionError, OneBotTransportError } from "../onebot/onebot-action-client";
 import { OneBotReverseWsServer, type OneBotListeningInfo } from "../onebot/onebot-reverse-ws";
 import { isOneBotMessageEvent, oneBotId, type OneBotSegment } from "../onebot/onebot-types";
-import { isQqEventAllowed, normalizeOneBotMessage, oneBotMessageEventId, splitQqText } from "../onebot/codec";
+import { INBOUND_NORMALIZATION_BUDGET_MS, isQqEventAllowed, normalizeOneBotMessage, oneBotMessageEventId, splitQqText } from "../onebot/codec";
 
 /** Fail-closed baseline; per-connection probes may enable NapCat media. */
 export const TEXT_CAPABILITIES: QqCapabilitySnapshot = {
@@ -31,6 +31,7 @@ export interface QqSessionOptions {
   actionTimeoutMs?: number;
   sendDelayMs?: number;
   sendBudgetMs?: number;
+  normalizationBudgetMs?: number;
 }
 
 /** No settings files, Electron, plugin SDK, sessions, workspace, LLM or storage access. */
@@ -61,6 +62,9 @@ export class QqOneBotSession {
     }
     if (options.sendBudgetMs !== undefined && (!Number.isSafeInteger(options.sendBudgetMs) || options.sendBudgetMs < 1 || options.sendBudgetMs > QQ_RUNTIME_TIMEOUTS.sendBudgetMs)) {
       throw new Error("Invalid QQ send budget");
+    }
+    if (options.normalizationBudgetMs !== undefined && (!Number.isSafeInteger(options.normalizationBudgetMs) || options.normalizationBudgetMs < 1 || options.normalizationBudgetMs > INBOUND_NORMALIZATION_BUDGET_MS)) {
+      throw new Error("Invalid QQ normalization budget");
     }
     this.config = structuredClone(options.config);
     this.server = new OneBotReverseWsServer({
@@ -157,11 +161,12 @@ export class QqOneBotSession {
       try {
         const message = await normalizeOneBotMessage(value, {
           selfId: this.config.expectedSelfId, connectionEpoch: epoch,
-          configRevision: this.config.configRevision, client,
-          ...(this.capabilities.backend.napcatStream ? { resolveMedia: async (segment: OneBotSegment, eventId: string) => {
+          configRevision: this.config.configRevision, client, actionTimeoutMs: this.options.actionTimeoutMs,
+          normalizationBudgetMs: this.options.normalizationBudgetMs,
+          ...(this.capabilities.backend.napcatStream ? { resolveMedia: async (segment: OneBotSegment, eventId: string, deadline: number) => {
             const media = await downloadMedia(client, this.spool, epoch, eventId, segment, () => {
               if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) throw new Error("Stale media connection");
-            });
+            }, deadline);
             downloaded.push(media.mediaId);
             return media;
           } } : {}),

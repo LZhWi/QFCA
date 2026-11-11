@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { downloadMedia, opaqueBackendFileId, safeFilename } from './media';
 import type { OneBotActionClient } from './onebot-action-client';
 import type { OneBotStreamPacket } from './onebot-types';
 import { MediaSpool, MEDIA_LIMITS } from '../runtime/media-spool';
 const spools: MediaSpool[] = [];
-afterEach(() => { for (const s of spools.splice(0)) s.dispose(); });
+afterEach(() => { vi.restoreAllMocks(); for (const s of spools.splice(0)) s.dispose(); });
 function fake(packets: OneBotStreamPacket[]) {
   return { callStream: async (_a: string, _p: unknown, cb: (packet: OneBotStreamPacket) => void) => { for (const p of packets) cb(p); return packets.at(-1); } } as unknown as OneBotActionClient;
 }
@@ -15,6 +15,34 @@ function packets(infoSize: number): OneBotStreamPacket[] { return [
   { type: 'response', data_type: 'file_complete', total_chunks: 1, total_bytes: data.length },
 ]; }
 describe('NapCat download boundary', () => {
+  it.each(['file_chunk', 'file_complete'])('checks the shared deadline before accepting a late %s and releases the partial handle', async (late) => {
+    let clock = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const spool = new MediaSpool(); spools.push(spool);
+    const release = vi.spyOn(spool, 'release');
+    const callStream = vi.fn(async (_action, _params, callback, timeoutMs) => {
+      expect(timeoutMs).toBe(25);
+      const stream = packets(data.length);
+      callback(stream[0]);
+      if (late === 'file_complete') callback(stream[1]);
+      clock = 25;
+      if (late === 'file_chunk') callback(stream[1]);
+      return stream[2];
+    });
+    await expect(downloadMedia({ callStream } as unknown as OneBotActionClient, spool, 1, 'event',
+      { type: 'image', data: { file: 'opaque' } }, () => undefined, 25)).rejects.toThrow('Media unavailable');
+    expect(callStream).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(() => spool.read(1, release.mock.calls[0][1], 'event', 0, 65536)).toThrow();
+  });
+  it('does not start a request once the shared deadline has expired', async () => {
+    vi.spyOn(performance, 'now').mockReturnValue(100);
+    const spool = new MediaSpool(); spools.push(spool);
+    const callStream = vi.fn();
+    await expect(downloadMedia({ callStream } as unknown as OneBotActionClient, spool, 1, 'event',
+      { type: 'file', data: { file: 'opaque' } }, () => undefined, 100)).rejects.toThrow('Media unavailable');
+    expect(callStream).not.toHaveBeenCalled();
+  });
   it.each([1, 999])('uses actual bounded converted audio size instead of original silk size %s', async (size) => {
     const spool = new MediaSpool(); spools.push(spool);
     const media = await downloadMedia(fake(packets(size)), spool, 1, 'event', { type: 'record', data: { file: 'id.silk' } }, () => undefined);

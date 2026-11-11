@@ -14,7 +14,7 @@ async function freePort(): Promise<number> {
 type Action = { action: string; echo: string; params: Record<string, unknown> };
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(response?: (action: Action, socket: WebSocket) => boolean, selfId = "10001", onInbound?: (message: QqInboundMessageV1) => Promise<void>, controls: Pick<QqSessionOptions, "sendBudgetMs" | "sendDelayMs" | "actionTimeoutMs" | "mediaTransfer"> = {}) {
+async function fixture(response?: (action: Action, socket: WebSocket) => boolean, selfId = "10001", onInbound?: (message: QqInboundMessageV1) => Promise<void>, controls: Pick<QqSessionOptions, "sendBudgetMs" | "sendDelayMs" | "actionTimeoutMs" | "mediaTransfer" | "normalizationBudgetMs"> = {}) {
   const inbound: QqInboundMessageV1[] = [];
   const config: QqRuntimeConfig = { configRevision: 3, listen: { host: "127.0.0.1", port: await freePort() },
     expectedSelfId: "10001", allowedPrivateUserIds: ["10002"], allowedGroupIds: ["20001"], groupRequireMention: true };
@@ -223,13 +223,117 @@ function napcatFake(hook?: (action: Action, socket: WebSocket) => boolean) {
   };
 }
 
-async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolean) {
-  const f = await fixture(napcatFake(hook), "10001", undefined, { mediaTransfer: "chunked-v1" });
+async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolean, controls: Pick<QqSessionOptions, "normalizationBudgetMs" | "actionTimeoutMs"> = {}) {
+  const f = await fixture(napcatFake(hook), "10001", undefined, { mediaTransfer: "chunked-v1", ...controls });
   await vi.waitFor(() => expect(f.session.getCapabilities().backend.napcatStream).toBe(true));
   return f;
 }
 
 describe('NapCat media session', () => {
+  it('bounds failed download attempts and lets the next queued text message through', async () => {
+    const f = await mediaFixture((action, socket) => {
+      if (!action.action.startsWith('download_file_')) return false;
+      socket.send(JSON.stringify({ status: 'failed', retcode: 1, echo: action.echo, wording: 'unavailable' }));
+      return true;
+    });
+    f.socket.send(JSON.stringify(f.message({ message: [
+      { type: 'text', data: { text: 'preserved' } },
+      ...Array.from({ length: 1023 }, (_, i) => ({ type: 'image', data: { file: `image_${i}` } })),
+    ] })));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5002 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(f.actions.filter((action) => action.action.startsWith('download_file_'))).toHaveLength(16);
+    expect(f.inbound[0].text).toContain('preserved');
+    expect(f.inbound[0].attachments).toBeUndefined();
+    expect(f.inbound[1].backendMessageId).toBe('5002');
+  });
+
+  it('shares the message budget, cleans a timed-out partial stream and ignores late packets', async () => {
+    let downloads = 0;
+    let stalled: Action | undefined;
+    const f = await mediaFixture((action, socket) => {
+      if (action.action === 'get_msg') return true;
+      if (!action.action.startsWith('download_file_')) return false;
+      downloads++;
+      if (downloads === 1 || action.params.file_id === 'next') return false;
+      if (downloads === 2) {
+        setTimeout(() => {
+          if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ status: 'failed', retcode: 1, echo: action.echo }));
+        }, 20);
+      } else if (downloads === 3) {
+        stalled = action;
+        socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: action.echo,
+          data: { type: 'stream', data_type: 'file_info', file_size: 1, chunk_size: 65536 } }));
+      } else socket.send(JSON.stringify({ status: 'failed', retcode: 1, echo: action.echo }));
+      return true;
+    }, { normalizationBudgetMs: 100, actionTimeoutMs: 1000 });
+    const heartbeat = setInterval(() => {
+      if (f.socket.readyState === WebSocket.OPEN) f.socket.send(JSON.stringify({ post_type: 'meta_event', meta_event_type: 'heartbeat' }));
+    }, 10);
+    cleanups.push(async () => { clearInterval(heartbeat); });
+    const started = performance.now();
+    f.socket.send(JSON.stringify(f.message({ message: [
+      ...['kept', 'failed', 'stalled', 'skipped'].map((file) => ({ type: 'image', data: { file } })),
+      { type: 'reply', data: { id: 'late-reply' } },
+      { type: 'text', data: { text: 'preserved' } },
+    ] })));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5002 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(performance.now() - started).toBeLessThan(750);
+    // An early timer may leave one millisecond of the shared budget. It must
+    // not renew that budget or leave the partial download alive.
+    expect(downloads).toBeGreaterThanOrEqual(3);
+    expect(downloads).toBeLessThanOrEqual(4);
+    expect(f.actions.filter((action) => action.action === 'get_msg').length).toBeLessThanOrEqual(1);
+    const first = f.inbound[0];
+    expect(first.attachments).toHaveLength(1);
+    expect(first.text).toContain('preserved');
+    expect(first.reply).toEqual({ messageId: 'late-reply' });
+    for (const data of [
+      { type: 'stream', data_type: 'file_chunk', index: 0, size: 1, data: 'eA==' },
+      { type: 'response', data_type: 'file_complete', total_chunks: 1, total_bytes: 1 },
+    ]) f.socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: stalled!.echo, data }));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5003 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(3));
+    // The earlier success still belongs to the host; the partial/late stream
+    // owns neither a slot nor quota, and did not revive after timeout.
+    expect(f.session.mediaRead({ connectionEpoch: 1, eventId: first.eventId, mediaId: first.attachments![0].mediaId, offset: 0, limit: 65536 }).eof).toBe(true);
+    const reservations = Array.from({ length: 255 }, (_, i) => f.session.mediaBeginUpload({
+      connectionEpoch: 1, operationId: `deadline_${i}`, conversation: { type: 'private', peerId: '10002' },
+      media: { kind: 'file', size: 1 }, sha256: '0'.repeat(64),
+    }));
+    for (const reservation of reservations) f.session.mediaRelease({ connectionEpoch: 1, ...reservation });
+    f.socket.send(JSON.stringify(f.message({ message_id: 5004, message: [{ type: 'image', data: { file: 'next' } }] })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(4));
+    expect(f.inbound[3].attachments).toHaveLength(1);
+  });
+
+  it('shares the budget with nickname and reply lookups before downloading media', async () => {
+    // Advance the monotonic clock through the whole budget on the stalled
+    // request. Real timers may fire a fraction early, so do not use their
+    // scheduling precision to assert that no budget remains.
+    const now = performance.now.bind(performance);
+    let elapsed = 0;
+    const f = await mediaFixture((action) => {
+      if (action.action === 'get_group_member_info') { elapsed = 50; return true; }
+      return action.action === 'get_msg';
+    },
+      { normalizationBudgetMs: 50, actionTimeoutMs: 1000 });
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now() + elapsed);
+    cleanups.push(async () => { clock.mockRestore(); });
+    f.socket.send(JSON.stringify(f.message({ message_type: 'group', group_id: '20001', message: [
+      { type: 'at', data: { qq: '10001' } },
+      { type: 'reply', data: { id: 'original' } },
+      { type: 'image', data: { file: 'skipped' } },
+      { type: 'text', data: { text: 'preserved' } },
+    ] })));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5002 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(f.actions.filter((action) => action.action === 'get_group_member_info')).toHaveLength(1);
+    expect(f.actions.filter((action) => action.action === 'get_msg' || action.action.startsWith('download_file_'))).toHaveLength(0);
+    expect(f.inbound[0]).toMatchObject({ text: '[附件不可用:image]preserved', reply: { messageId: 'original' }, mentions: [{ userId: '10001' }] });
+  });
+
   it.each(["", " \t ", "\u00a0\u3000\ufeff"])("rejects unauthenticated media opt-in before probing or advertising: %j", (accessToken) => {
     const capabilities = vi.fn(); const status = vi.fn(); const inbound = vi.fn();
     expect(() => new QqOneBotSession({
