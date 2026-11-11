@@ -11,6 +11,7 @@ export interface OneBotReverseWsOptions {
   /** Only unscoped loopback IP literals; remote backends need a secure tunnel. */
   host: string;
   port: number;
+  /** Required at runtime, including loopback; existing nonempty tokens keep trim semantics. */
   accessToken?: string;
   expectedSelfId: string;
   heartbeatTimeoutMs?: number;
@@ -32,13 +33,14 @@ export function validateListenAddress(host: string, port: number, token = ""): v
   const family = isIP(host);
   if (!family || host.includes("%")) throw new Error("OneBot host must be an unscoped literal IP address");
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("Invalid OneBot port");
-  if (token.length > 4096 || /[\r\n\0]/.test(token)) throw new Error("Invalid Access Token");
+  if (typeof token !== "string" || token.length > 4096 || /[\r\n\0]/.test(token)) throw new Error("Invalid Access Token");
   if (!loopbackAddresses.check(host, family === 4 ? "ipv4" : "ipv6")) {
     throw new Error("OneBot listeners require a loopback IP address even with an Access Token; use an authenticated encrypted tunnel for remote backends");
   }
+  if (!token.trim()) throw new Error("A nonempty Access Token is required");
 }
 function tokenMatches(header: string | undefined, expected: string): boolean {
-  if (!expected) return true;
+  if (!expected) return false;
   const a = Buffer.from(header?.startsWith("Bearer ") ? header.slice(7) : "");
   const b = Buffer.from(expected);
   return a.length === b.length && timingSafeEqual(a, b);
