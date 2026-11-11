@@ -1,15 +1,18 @@
 {
   "repository": "Playa-Cyrene/Cyrene-Agent",
   "sourceDirectory": "src/shared/qq-module",
-  "baseCommit": "46b27ce9b95f3254621df2238d3bb97554edfefa",
-  "companionBranch": "feat/qq-module-host-runtime",
-  "status": "unpublished companion candidate; includes required send.connectionEpoch revision",
+  "baseCommit": "57216fa98c538b95d8964c0ad1842b7c23a0ea95",
+  "companionBranch": "feat/qq-module-media",
+  "status": "unpublished companion candidate; explicit chunked-v1 opt-in required for media; text initialization remains compatible",
   "sha256": {
-    "index.ts": "6e5db44e75de80394d6d60ed271ac989acc7ce4c067cd2e74c3512e6dff77b74",
+    "contract.test.ts": "3ba26b7bf9397476dd6c2aa93104adad41a1d07f68ec2fffbcef54078d702156",
+    "index.ts": "2d833297a321034361ce5106ae744724eedc1e493283cb3cb8ab3b22db210cf5",
+    "media.test.ts": "5042e938fd235d1bb4f131b79e89ba16a9d46f537f137066e3d4244a7dd3ef11",
+    "media.ts": "522f52a6ee9c9b097e64eca06b43bc2f873fbd7ef24f3f1dec9550d0a78bdf20",
+    "runtime.test.ts": "b108d318ded4c16ea1381bdffb3747c18ac18188c602b31cbf751168b3df37a4",
+    "runtime.ts": "21bae2529bc197b84ef01704dec8dcbbbdf94e8f32cdb7148752519a339d9381",
     "types.ts": "431639326b174a6b75b8561ecd48517f6e98e93253c122c4d404ada76b26fe62",
     "validation.ts": "db41dafb3918ec32e070b038f4f624df813b0c65ffd38d82b545d4d2fd2af6f1",
-    "version.ts": "0dd2bc5423218aa84bfbcdc767591b63bb84efd4121c6d370fc2a602b0b2f36a",
-    "runtime.ts": "def58c3e21a2f4ae195828820d87f19595dfedf7c0e04196ba7d2ecc12ec9679",
-    "contract.test.ts": "3ba26b7bf9397476dd6c2aa93104adad41a1d07f68ec2fffbcef54078d702156"
+    "version.ts": "0dd2bc5423218aa84bfbcdc767591b63bb84efd4121c6d370fc2a602b0b2f36a"
   }
 }

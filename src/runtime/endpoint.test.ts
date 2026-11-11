@@ -53,6 +53,20 @@ describe("QqProtocolEndpoint", () => {
     expect(JSON.stringify(output)).not.toContain("secret");
     await endpoint.close();
   });
+  it.each(["", " \t ", "\u00a0\u3000"])("does not advertise media after blank-token initialization: %j", async (accessToken) => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", { ...initialize, credentials: { accessToken }, mediaTransfer: "chunked-v1" }));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "invalid-request" } });
+    await endpoint.receive(request("start", {}));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "not-initialized" } });
+    expect(output.some((value) => value.kind === "event")).toBe(false);
+    await endpoint.receive(request("initialize", { ...initialize, mediaTransfer: "chunked-v1" }, "corrected-media"));
+    expect(output.at(-1)).toMatchObject({ ok: true, payload: { capabilities: { messages: { image: false, file: false } } } });
+    expect(JSON.stringify(output)).not.toContain("secret");
+    await endpoint.close();
+  });
   it("never executes a replay after a busy terminal response", async () => {
     const output: QqEnvelope[] = [];
     const endpoint = new QqProtocolEndpoint((value) => output.push(value));
@@ -152,4 +166,20 @@ describe("QqProtocolEndpoint", () => {
     expect(endpoint.isClosed).toBe(true);
     expect(await endpoint.receive(request("ping", {}, "exhausted"))).toBe(false);
   });
+});
+
+it('keeps transfer chunks out of the lifetime control replay budget', async () => {
+  const output: QqEnvelope[] = [];
+  const endpoint = new QqProtocolEndpoint((value) => output.push(value), () => ({
+    start: async () => ({ phase: 'waiting-backend' }), stop: async () => undefined,
+    quiesce: () => undefined, send: vi.fn(), mediaWrite: () => ({}),
+  }));
+  await endpoint.receive(request('hello', {}));
+  await endpoint.receive(request('initialize', initialize));
+  await endpoint.receive(request('start', {}));
+  for (let i = 0; i < 10010; i++) await endpoint.receive(request('mediaWrite', { connectionEpoch: 1, mediaId: 'handle', offset: i, data: 'YQ==' }, `chunk_${i}`));
+  await endpoint.receive(request('ping', {}, 'still_alive'));
+  expect(endpoint.isClosed).toBe(false);
+  expect(output.at(-1)).toMatchObject({ responseTo: 'still_alive', ok: true });
+  await endpoint.close();
 });

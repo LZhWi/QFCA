@@ -6,7 +6,7 @@ import {
 import { QqOneBotSession, TEXT_CAPABILITIES, type QqSessionOptions } from "./session";
 
 export const MODULE_VERSION = "0.1.0-dev.0";
-type Session = Pick<QqOneBotSession, "start" | "stop" | "quiesce" | "send">;
+type Session = Pick<QqOneBotSession, "start" | "stop" | "quiesce" | "send"> & Partial<Pick<QqOneBotSession, "mediaBeginUpload" | "mediaWrite" | "mediaRead" | "mediaRelease">>;
 export type SessionFactory = (options: QqSessionOptions) => Session;
 
 /** A private local endpoint, not an arbitrary OneBot-action or plugin port. */
@@ -17,6 +17,7 @@ export class QqProtocolEndpoint {
   private started = false;
   private closed = false;
   private requests = new Set<string>();
+  private inFlightRequests = new Set<string>();
   private pending = 0;
   private pendingControl = 0;
   private lifecycle: Promise<unknown> = Promise.resolve();
@@ -36,23 +37,25 @@ export class QqProtocolEndpoint {
       this.identity = { apiVersion: request.apiVersion, instanceId: request.instanceId, runtimeEpoch: request.runtimeEpoch };
     }
     if (request.instanceId !== this.identity.instanceId || request.runtimeEpoch !== this.identity.runtimeEpoch) return false;
-    if (this.requests.has(request.requestId)) return false;
+    if (this.requests.has(request.requestId) || this.inFlightRequests.has(request.requestId)) return false;
+    const transferChunk = ["mediaWrite", "mediaRead", "mediaRelease"].includes(request.method);
     // Every terminal response consumes its replay tombstone, including busy.
     // Exhaustion is a visible process failure, never a silent permanently
     // unresponsive "running" module. The entry exits after close, and the
     // host must make an explicit new-instance decision; no replay is made.
-    if (this.requests.size >= 10000) {
+    if (!transferChunk && this.requests.size >= 10000) {
       this.respond(request, "busy");
       await this.close();
       return true;
     }
-    this.requests.add(request.requestId);
+    if (!transferChunk) this.requests.add(request.requestId);
     // Work saturation must not prevent shutdown or inbound pressure relief.
     // Reserve a separate bounded lane; lifecycle ordering remains unchanged.
     const control = ["quiesce", "stop", "ackInbound"].includes(request.method);
     if (control ? this.pendingControl >= 16 : this.pending >= 64) {
       this.respond(request, "busy"); return true;
     }
+    this.inFlightRequests.add(request.requestId);
     if (control) this.pendingControl++; else this.pending++;
     try {
       const execute = async () => {
@@ -65,8 +68,9 @@ export class QqProtocolEndpoint {
             try {
               this.session = this.factory({
                 config: request.payload.config, accessToken: request.payload.credentials.accessToken,
-                runtimeEpoch: request.runtimeEpoch,
+                runtimeEpoch: request.runtimeEpoch, mediaTransfer: request.payload.mediaTransfer,
                 onInbound: (message) => this.inbound(message),
+                onCapabilities: (capabilities) => this.event("capability-changed", capabilities),
                 onStatus: (status) => this.event("status", status),
               });
             } catch { this.respond(request, "invalid-request"); return; }
@@ -83,6 +87,14 @@ export class QqProtocolEndpoint {
           case "send": {
             if (!this.session || !this.started) { this.respond(request, "not-running"); return; }
             payload = await this.session.send(request.payload);
+            break;
+          }
+          case "mediaBeginUpload": case "mediaWrite": case "mediaRead": case "mediaRelease": {
+            if (!this.session || !this.started) { this.respond(request, "not-running"); return; }
+            // Dispatch narrow, already validated media methods only; old test sessions stay compatible.
+            const method = this.session[request.method];
+            if (!method) { this.respond(request, "invalid-request"); return; }
+            payload = await (method as (value: unknown) => unknown).call(this.session, request.payload);
             break;
           }
           case "quiesce": {
@@ -112,7 +124,10 @@ export class QqProtocolEndpoint {
         await next;
       } else await execute();
     } catch { if (!this.closed) this.respond(request, "internal"); }
-    finally { if (control) this.pendingControl--; else this.pending--; }
+    finally {
+      if (control) this.pendingControl--; else this.pending--;
+      this.inFlightRequests.delete(request.requestId);
+    }
     return true;
   }
   private respond(request: QqRequest, code: QqRuntimeErrorCode): void {
