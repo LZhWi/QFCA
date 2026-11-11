@@ -16,12 +16,78 @@ async function connect(url: string, account = "10001") {
   return socket;
 }
 describe("OneBotReverseWsServer", () => {
-  it("validates literal bind addresses and requires auth outside loopback", () => {
-    expect(() => validateListenAddress("0.0.0.0", 3001)).toThrow("Access Token");
-    expect(() => validateListenAddress("::", 3001)).toThrow("Access Token");
-    expect(() => validateListenAddress("example.com", 3001, "token")).toThrow("resolved IP");
-    expect(() => validateListenAddress("127.0.0.1", 3001)).not.toThrow();
-    expect(() => validateListenAddress("::1", 3001)).not.toThrow();
+  it.each([
+    "127.0.0.1", "127.0.0.2", "127.255.255.254", "::1", "0:0:0:0:0:0:0:1",
+    "::ffff:127.0.0.1", "::FFFF:7f00:0001", "0:0:0:0:0:ffff:7fff:fffe",
+  ])("accepts loopback literal %s with or without a token", (host) => {
+    for (const token of [undefined, "", "token"]) expect(() => validateListenAddress(host, 3001, token)).not.toThrow();
+  });
+  it.each([
+    "0.0.0.0", "::", "192.168.1.10", "172.28.64.1", "10.0.0.1", "169.254.1.1", "8.8.8.8",
+    "126.255.255.255", "128.0.0.1", "fe80::1", "fd00::1", "2001:db8::1", "::127.0.0.1",
+    "::ffff:0.0.0.0", "::ffff:192.168.1.10", "::FFFF:c0a8:10a", "0:0:0:0:0:ffff:8000:1",
+  ])("rejects non-loopback %s even with a token", (host) => {
+    for (const token of [undefined, "", "token"]) {
+      expect(() => validateListenAddress(host, 3001, token)).toThrow("require a loopback IP address even with an Access Token");
+      expect(() => server({ host, accessToken: token })).toThrow("authenticated encrypted tunnel");
+    }
+  });
+  it.each([
+    "", "localhost", "localhost.", "example.com", "127.0.0.1.example.com", "127.1", "2130706433",
+    "0177.0.0.1", "0x7f000001", "127.000.000.001", "[::1]", "::1%lo", "::1%1", "127.0.0.1 ", "127.0.0.1\0",
+  ])("rejects DNS names and ambiguous or scoped addresses: %s", (host) => {
+    expect(() => validateListenAddress(host, 3001, "token")).toThrow("unscoped literal IP address");
+  });
+  it("preserves port and raw token validation on loopback", () => {
+    for (const port of [-1, 65536, 1.5, NaN]) expect(() => validateListenAddress("127.0.0.1", port)).toThrow("Invalid OneBot port");
+    for (const token of ["token\r", "\ntoken", "token\0", "t".repeat(4097)]) {
+      expect(() => validateListenAddress("127.0.0.1", 3001, token)).toThrow("Invalid Access Token");
+    }
+  });
+  it.each(["127.0.0.1", "127.0.0.2", "::1", "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1", "::FFFF:7f00:0001"])(
+    "binds and accepts authenticated local WebSockets on %s", async (host) => {
+      const connected = vi.fn();
+      const value = server({ host, onClientConnected: connected });
+      const info = await value.start();
+      expect(info.host).toBe(host);
+      const socket = await connect(info.url);
+      await vi.waitFor(() => expect(connected).toHaveBeenCalledOnce());
+      socket.terminate();
+    },
+  );
+  it("keeps token-free local connections available", async () => {
+    const value = server({ accessToken: "" });
+    const info = await value.start();
+    const socket = new WebSocket(info.url, { headers: { "X-Self-ID": "10001" } });
+    await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+    socket.terminate();
+  });
+  it("revalidates the exact bind inputs on queued start and restart", async () => {
+    const options = { host: "127.0.0.1", port: 0, accessToken: "token", expectedSelfId: "10001",
+      onClientConnected: () => undefined, onEvent: () => undefined };
+    const value = new OneBotReverseWsServer(options); servers.push(value);
+    const listen = vi.spyOn(http.Server.prototype, "listen");
+    try {
+      const pending = value.start();
+      options.host = "0.0.0.0";
+      await expect(pending).rejects.toThrow("loopback IP address");
+      expect(listen).not.toHaveBeenCalled();
+      expect(value.info).toBeNull();
+      options.host = "127.0.0.1";
+      await value.start(); await value.stop();
+      listen.mockClear();
+      options.host = "::ffff:192.168.1.10";
+      await expect(value.start()).rejects.toThrow("loopback IP address");
+      expect(listen).not.toHaveBeenCalled();
+      options.host = "localhost";
+      await expect(value.start()).rejects.toThrow("literal IP address");
+      expect(listen).not.toHaveBeenCalled();
+      options.host = "127.0.0.1"; options.accessToken = "token\r";
+      await expect(value.start()).rejects.toThrow("Invalid Access Token");
+      expect(listen).not.toHaveBeenCalled();
+      options.accessToken = "token";
+      await value.start();
+    } finally { listen.mockRestore(); }
   });
   it("serializes repeated start/stop and closes HTTP keepalive sockets", async () => {
     const value = server();

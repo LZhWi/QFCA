@@ -1,14 +1,14 @@
 // Adapted from Cyrene-Agent; see NOTICE and LICENSES/Cyrene-Agent-MIT.txt.
 import * as http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { isIP, type Socket } from "node:net";
+import { BlockList, isIP, type Socket } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
 import { OneBotActionClient } from "./onebot-action-client";
 
 export const ONEBOT_WS_PATH = "/onebot/v11/ws";
 export const MAX_ONEBOT_PAYLOAD = 256 * 1024;
 export interface OneBotReverseWsOptions {
-  /** Host resolves legacy auto/WSL settings; this module accepts literal IPs only. */
+  /** Only unscoped loopback IP literals; remote backends need a secure tunnel. */
   host: string;
   port: number;
   accessToken?: string;
@@ -22,12 +22,19 @@ export interface OneBotReverseWsOptions {
 }
 export interface OneBotListeningInfo { host: string; port: number; path: string; url: string }
 
+// Node's address matcher handles expanded IPv6 and IPv4-mapped IPv6 without
+// DNS or prefix-string heuristics. No wildcard or other interface is allowed.
+const loopbackAddresses = new BlockList();
+loopbackAddresses.addSubnet("127.0.0.0", 8, "ipv4");
+loopbackAddresses.addAddress("::1", "ipv6");
+
 export function validateListenAddress(host: string, port: number, token = ""): void {
-  if (!isIP(host)) throw new Error("OneBot host must be a resolved IP address");
+  const family = isIP(host);
+  if (!family || host.includes("%")) throw new Error("OneBot host must be an unscoped literal IP address");
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("Invalid OneBot port");
   if (token.length > 4096 || /[\r\n\0]/.test(token)) throw new Error("Invalid Access Token");
-  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(host) && !token.trim()) {
-    throw new Error("Non-loopback OneBot listeners require an Access Token");
+  if (!loopbackAddresses.check(host, family === 4 ? "ipv4" : "ipv6")) {
+    throw new Error("OneBot listeners require a loopback IP address even with an Access Token; use an authenticated encrypted tunnel for remote backends");
   }
 }
 function tokenMatches(header: string | undefined, expected: string): boolean {
@@ -72,8 +79,11 @@ export class OneBotReverseWsServer {
   }
   private async startInternal(): Promise<OneBotListeningInfo> {
     if (this.listeningInfo) return this.listeningInfo;
-    const { host, port } = this.options;
-    const token = this.options.accessToken?.trim() ?? "";
+    const { host, port, accessToken } = this.options;
+    // Options may have changed since construction or a previous start. Check
+    // the exact values used below before creating any listener, without DNS.
+    validateListenAddress(host, port, accessToken);
+    const token = accessToken?.trim() ?? "";
     const server = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
     server.on("connection", (socket) => {
       this.connections.add(socket);

@@ -26,14 +26,17 @@ describe("QqProtocolEndpoint", () => {
     expect(await endpoint.receive({ ...request("stop", {}), apiVersion: { major: 1, minor: 1 } })).toBe(false);
     await endpoint.close();
   });
-  it("fails closed on invalid initialization and never starts a listener", async () => {
+  it.each(["0.0.0.0", "::", "172.28.64.1", "192.168.1.10", "::ffff:192.168.1.10", "localhost"])("fails closed for %s despite a token, and permits corrected initialization", async (host) => {
     const output: QqEnvelope[] = [];
     const endpoint = new QqProtocolEndpoint((value) => output.push(value));
     await endpoint.receive(request("hello", {}));
-    await endpoint.receive(request("initialize", { ...initialize, config: { ...initialize.config, listen: { host: "0.0.0.0", port: 3001 } }, credentials: { accessToken: "" } }));
+    await endpoint.receive(request("initialize", { ...initialize, config: { ...initialize.config, listen: { host, port: 3001 } } }));
     expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "invalid-request" } });
     await endpoint.receive(request("start", {}));
     expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "not-initialized" } });
+    await endpoint.receive(request("initialize", initialize, "corrected"));
+    expect(output.at(-1)).toMatchObject({ responseTo: "corrected", ok: true });
+    expect(JSON.stringify(output)).not.toContain("secret");
     await endpoint.close();
   });
   it("never executes a replay after a busy terminal response", async () => {
