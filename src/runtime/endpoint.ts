@@ -5,7 +5,9 @@ import {
 } from "../contract";
 import { QqOneBotSession, TEXT_CAPABILITIES, type QqSessionOptions } from "./session";
 
-export const MODULE_VERSION = "0.1.0-dev.0";
+// package metadata is copied into the signed payload. A rehearsal version is
+// explicit and never silently derived by stripping the development suffix.
+export const MODULE_VERSION: string = (require("../../package.json") as { version: string }).version;
 type Session = Pick<QqOneBotSession, "start" | "stop" | "quiesce" | "send"> & Partial<Pick<QqOneBotSession, "mediaBeginUpload" | "mediaWrite" | "mediaRead" | "mediaRelease">>;
 export type SessionFactory = (options: QqSessionOptions) => Session;
 

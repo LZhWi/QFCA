@@ -1,0 +1,9 @@
+{
+  "version": "0.0.0",
+  "releaseSequence": 1,
+  "keyId": "ephemeral-rehearsal-only",
+  "issuedAt": 1000,
+  "expiresAt": 2000,
+  "hostVersionRange": { "minInclusive": "1.3.7", "maxExclusive": "1.3.8" },
+  "targets": [{ "platform": "linux", "arch": "x64" }]
+}

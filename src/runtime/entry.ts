@@ -1,3 +1,4 @@
+import "./pure-js";
 import { QqProtocolEndpoint } from "./endpoint";
 import type { QqEnvelope } from "../contract";
 

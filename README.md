@@ -68,3 +68,10 @@ npm pack --dry-run
 ## 版权
 
 QFCA 自身 MIT 许可证保留在 `LICENSE`。迁入/改写的 Cyrene-Agent 代码保留 `Copyright (c) 2026 Playa` 及完整 MIT 文本，见 `LICENSES/Cyrene-Agent-MIT.txt` 和 `NOTICE`。再分发必须同时保留这些文件，不能用 QFCA 自身版权覆盖上游归属。
+
+## 离线发行准备（未发布、未启用安装）
+
+新增 `npm run test:release`、`release:prepare` 与 `release:rehearse`，可在离线缓存上构建完整 ws 纯 JS 闭包并校验复现。
+输出仅为未签名候选；测试密钥只存在于内存，生产信任根和发行开关未配置。
+显式稳定候选版本与包内 IPC hello 保持一致，源码版本仍为 `0.1.0-dev.0`。
+详细输入、许可证、签名边界、运行命令及未完成项见 [离线发行准备](docs/offline-release-preparation.md)。
