@@ -37,6 +37,7 @@ async function waitFor(check) {
   throw new Error("Timed out waiting for module event");
 }
 let ws;
+let malformed;
 try {
   const hello = await request("hello", {});
   assert.equal(hello.moduleId, "qfca");
@@ -51,6 +52,16 @@ try {
   }, credentials: { accessToken: "smoke-token" } });
   assert.equal(initialized.capabilities.messages.image, false);
   assert.equal((await request("start", {})).phase, "waiting-backend");
+  malformed = new WebSocket(`ws://127.0.0.1:${port}/onebot/v11/ws`, { headers: { "X-Self-ID": "10001", Authorization: "Bearer smoke-token" } });
+  let malformedCloseCode;
+  malformed.on("close", (code) => { malformedCloseCode = code; });
+  malformed.on("message", (raw) => {
+    const { echo } = JSON.parse(raw.toString());
+    malformed.send(JSON.stringify({ echo, status: "failed", retcode: 1404, message: { toString: null } }));
+  });
+  await waitFor(() => malformedCloseCode !== undefined);
+  assert.equal(malformedCloseCode, 4002);
+  await request("ping", {}); // Malformed backend JSON must not crash the child.
   ws = new WebSocket(`ws://127.0.0.1:${port}/onebot/v11/ws`, { headers: { "X-Self-ID": "10001", Authorization: "Bearer smoke-token" } });
   let sendCount = 0;
   ws.on("message", (raw) => {
@@ -81,8 +92,9 @@ try {
   assert.equal(await exited, 0);
   clearTimeout(timeout);
   assert.equal(stderr, "");
-  console.log("PASS: compiled private IPC + non-loopback rejection + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
+  console.log("PASS: compiled private IPC + non-loopback rejection + malformed backend recovery + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
 } finally {
+  malformed?.terminate();
   ws?.terminate();
   if (child.connected) child.disconnect();
   child.kill();
