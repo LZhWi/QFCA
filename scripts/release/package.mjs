@@ -154,7 +154,7 @@ export function buildCandidate(plan, { root = ROOT, cache } = {}) {
       license: 'MIT', main: 'dist/index.js', types: 'dist/index.d.ts', engines: pkg.engines, dependencies: pkg.dependencies })));
     files.set('docs/build-provenance.json', Buffer.from(JSON.stringify({ format: 1, purpose: 'offline-candidate-only', node: process.versions.node, buildPlatform: process.platform, buildArch: process.arch,
       typescript: pkg.devDependencies.typescript, sourceVersion: pkg.version, candidateVersion: p.version, sourceTreeSha256: digest(Buffer.from(JSON.stringify(sourceInventory))), sourceFiles: sourceInventory,
-      packageLockSha256: digest(lockBytes), runtimeDependencies: [{ name: 'ws', version: wsLock.version, integrity: wsLock.integrity, license: 'MIT', optionalNativePeers: 'disabled' }] })));
+      checkoutAttributesSha256: digest(source('.gitattributes')), packageLockSha256: digest(lockBytes), runtimeDependencies: [{ name: 'ws', version: wsLock.version, integrity: wsLock.integrity, license: 'MIT', optionalNativePeers: 'disabled' }] })));
     return createCandidate(p, files);
   } finally { rmSync(work, { recursive: true, force: true }); }
 }

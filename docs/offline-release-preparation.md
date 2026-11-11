@@ -24,6 +24,7 @@ Cyrene-Agent #344 `4329d20d9704d18eacc928b5d08cc305029ae567`。
 - `targets`：显式的 platform/arch 组合；无默认“全平台兼容”。
 
 API 1.0 使用原始 `negotiateQqApi` 的最高公共 minor 规则；manifest 不改变其契约。
+`.gitattributes` 固定文本 LF checkout，避免 Windows 的自动 CRLF 转换改变已记录的来源字节；不对验收时的散列输入做宽松归一化。
 构建核对 9 个原始契约文件与 `contract-provenance.json` 的 SHA-256。
 宿主版本范围、API、系统/架构、时间都必须分别通过宿主验证；版本较新不能替代特性探测。
 `chunked-v1`、NapCat 实际媒体能力仍按原协商逻辑，不因打包而启用。

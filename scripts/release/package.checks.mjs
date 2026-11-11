@@ -122,3 +122,15 @@ test('input traversal rejects soft links, hard links, device-like paths and unsa
     writeFileSync(join(dir, 'nul.js'), 'fixture'); assert.throws(() => readPortableTree(dir), /unsafe-input-path/);
   }
 });
+
+test('repository attributes retain exact LF provenance bytes with core.autocrlf=true', () => {
+  const dir = join(temp, 'autocrlf'); mkdirSync(dir);
+  execFileSync('git', ['-c', 'core.autocrlf=true', 'init', dir], { stdio: 'pipe' });
+  writeFileSync(join(dir, '.gitattributes'), readFileSync(join(ROOT, '.gitattributes')));
+  const original = readFileSync(join(ROOT, 'src/contract/version.ts'));
+  writeFileSync(join(dir, 'version.ts'), original);
+  execFileSync('git', ['-c', 'core.autocrlf=true', 'add', '.gitattributes', 'version.ts'], { cwd: dir, stdio: 'pipe' });
+  rmSync(join(dir, 'version.ts'));
+  execFileSync('git', ['-c', 'core.autocrlf=true', 'checkout', '--', 'version.ts'], { cwd: dir, stdio: 'pipe' });
+  assert.ok(readFileSync(join(dir, 'version.ts')).equals(original));
+});
