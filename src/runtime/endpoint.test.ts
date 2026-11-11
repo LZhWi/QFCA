@@ -70,6 +70,64 @@ describe("QqProtocolEndpoint", () => {
     expect(output.some((v) => v.kind === "response" && v.responseTo === "send" && v.ok)).toBe(true);
     await endpoint.close();
   });
+  it("admits quiesce, ACK and stop with all 64 work slots occupied", async () => {
+    const output: QqEnvelope[] = [];
+    const releases: (() => void)[] = [];
+    const quiesce = vi.fn();
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value), () => ({
+      start: async () => ({ phase: "waiting-backend" }), quiesce,
+      send: (value) => new Promise((resolve) => releases.push(() => resolve({
+        operationId: (value as { operationId: string }).operationId, outcome: "unknown",
+        parts: [{ partIndex: 0, outcome: "unknown", errorCode: "disconnected" }],
+      }))),
+      stop: async () => { releases.forEach((release) => release()); },
+    }));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", initialize));
+    await endpoint.receive(request("start", {}));
+    const pending = Array.from({ length: 64 }, (_, i) => endpoint.receive(request("send", {
+      operationId: `op_${i}`, runtimeEpoch: 5, connectionEpoch: 1, selfId: "10001",
+      conversation: { type: "private", peerId: "10002" }, parts: [{ kind: "text", text: "hi" }],
+    }, `send_${i}`)));
+    expect(releases).toHaveLength(64);
+    await endpoint.receive(request("ping", {}, "overflow"));
+    await endpoint.receive(request("quiesce", {}));
+    await endpoint.receive(request("ackInbound", { eventId: "event", outcome: "accepted" }));
+    await endpoint.receive(request("stop", {}));
+    // Clean up even on the unfixed implementation, so the reproduction cannot hang.
+    releases.forEach((release) => release());
+    await Promise.all(pending);
+    expect(output).toContainEqual(expect.objectContaining({ responseTo: "overflow", ok: false, error: { code: "busy" } }));
+    for (const method of ["quiesce", "ackInbound", "stop"])
+      expect(output).toContainEqual(expect.objectContaining({ responseTo: method, ok: true }));
+    expect(quiesce).toHaveBeenCalledOnce();
+    for (let i = 0; i < 32; i++) {
+      await endpoint.receive(request("quiesce", {}, `recycled_${i}`));
+      expect(output.at(-1)).toMatchObject({ responseTo: `recycled_${i}`, ok: true });
+    }
+    await endpoint.close();
+  });
+  it("bounds the reserved control queue and retains busy replay protection", async () => {
+    const output: QqEnvelope[] = [];
+    let release!: () => void;
+    const stopped = new Promise<void>((resolve) => { release = resolve; });
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value), () => ({
+      start: async () => ({ phase: "waiting-backend" }), quiesce: vi.fn(), send: vi.fn(),
+      stop: () => stopped,
+    }));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", initialize));
+    const pending = Array.from({ length: 16 }, (_, i) => endpoint.receive(request("stop", {}, `stop_${i}`)));
+    const overflow = endpoint.receive(request("stop", {}, "control_overflow"));
+    await endpoint.receive(request("ping", {}, "work_available"));
+    const rejected = output.some((v) => v.kind === "response" && v.responseTo === "control_overflow" && !v.ok && v.error.code === "busy");
+    release();
+    await Promise.all([...pending, overflow]);
+    expect(rejected).toBe(true);
+    expect(output).toContainEqual(expect.objectContaining({ responseTo: "work_available", ok: true }));
+    expect(await endpoint.receive(request("stop", {}, "control_overflow"))).toBe(false);
+    await endpoint.close();
+  });
   it("closes visibly after the replay budget instead of silently hanging future stop/ping", async () => {
     const output: QqEnvelope[] = [];
     const endpoint = new QqProtocolEndpoint((value) => output.push(value));

@@ -18,6 +18,7 @@ export class QqProtocolEndpoint {
   private closed = false;
   private requests = new Set<string>();
   private pending = 0;
+  private pendingControl = 0;
   private lifecycle: Promise<unknown> = Promise.resolve();
   private inboundAcks = new Map<string, () => void>();
 
@@ -46,8 +47,13 @@ export class QqProtocolEndpoint {
       return true;
     }
     this.requests.add(request.requestId);
-    if (this.pending >= 64) { this.respond(request, "busy"); return true; }
-    this.pending++;
+    // Work saturation must not prevent shutdown or inbound pressure relief.
+    // Reserve a separate bounded lane; lifecycle ordering remains unchanged.
+    const control = ["quiesce", "stop", "ackInbound"].includes(request.method);
+    if (control ? this.pendingControl >= 16 : this.pending >= 64) {
+      this.respond(request, "busy"); return true;
+    }
+    if (control) this.pendingControl++; else this.pending++;
     try {
       const execute = async () => {
         if (this.closed) return;
@@ -106,7 +112,7 @@ export class QqProtocolEndpoint {
         await next;
       } else await execute();
     } catch { if (!this.closed) this.respond(request, "internal"); }
-    finally { this.pending--; }
+    finally { if (control) this.pendingControl--; else this.pending--; }
     return true;
   }
   private respond(request: QqRequest, code: QqRuntimeErrorCode): void {
