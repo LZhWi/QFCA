@@ -51,10 +51,19 @@ async function fixture(response?: (action: Action, socket: WebSocket) => boolean
 }
 
 describe("QqOneBotSession", () => {
+  it.each(["", " ", "\t", "\u00a0\u3000\ufeff"])("rejects blank credentials before any session side effects: %j", (accessToken) => {
+    const inbound = vi.fn(); const status = vi.fn();
+    expect(() => new QqOneBotSession({
+      config: { configRevision: 0, listen: { host: "127.0.0.1", port: 3001 }, expectedSelfId: "10001",
+        allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true },
+      accessToken, runtimeEpoch: 0, onInbound: inbound, onStatus: status,
+    })).toThrow("nonempty Access Token");
+    expect(inbound).not.toHaveBeenCalled(); expect(status).not.toHaveBeenCalled();
+  });
   it("does not bind before explicit start and only advertises implemented capabilities", async () => {
     const config = { configRevision: 0, listen: { host: "127.0.0.1", port: await freePort() }, expectedSelfId: "1",
       allowedPrivateUserIds: [], allowedGroupIds: [], groupRequireMention: true };
-    const session = new QqOneBotSession({ config, accessToken: "", runtimeEpoch: 0, onInbound: () => undefined });
+    const session = new QqOneBotSession({ config, accessToken: "test-secret", runtimeEpoch: 0, onInbound: () => undefined });
     expect(session.info).toBeNull();
     expect(TEXT_CAPABILITIES.messages.image).toBe(false);
     expect(TEXT_CAPABILITIES.backend.napcatStream).toBe(false);
@@ -221,6 +230,38 @@ async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolea
 }
 
 describe('NapCat media session', () => {
+  it.each(["", " \t ", "\u00a0\u3000\ufeff"])("rejects unauthenticated media opt-in before probing or advertising: %j", (accessToken) => {
+    const capabilities = vi.fn(); const status = vi.fn(); const inbound = vi.fn();
+    expect(() => new QqOneBotSession({
+      config: { configRevision: 0, listen: { host: "127.0.0.1", port: 3001 }, expectedSelfId: "10001",
+        allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true },
+      accessToken, runtimeEpoch: 0, mediaTransfer: "chunked-v1", onInbound: inbound,
+      onCapabilities: capabilities, onStatus: status,
+    })).toThrow("nonempty Access Token");
+    expect(capabilities).not.toHaveBeenCalled(); expect(status).not.toHaveBeenCalled(); expect(inbound).not.toHaveBeenCalled();
+  });
+  it("keeps media on the authenticated backend when a tokenless peer tries to replace it", async () => {
+    const { createHash } = await import('node:crypto'); const f = await mediaFixture();
+    const originalStatus = f.session.getStatus();
+    const received = vi.fn();
+    const status = await new Promise<number>((resolve, reject) => {
+      const impostor = new WebSocket(f.session.info!.url, { headers: { "X-Self-ID": "10001" } });
+      impostor.on("message", received);
+      impostor.on("open", () => { impostor.terminate(); reject(new Error("Unauthenticated media peer accepted")); });
+      impostor.on("unexpected-response", (_request, response) => { resolve(response.statusCode!); response.resume(); impostor.terminate(); });
+      impostor.on("error", () => undefined);
+    });
+    expect(status).toBe(401); expect(received).not.toHaveBeenCalled();
+    expect(f.session.getStatus()).toEqual(originalStatus); expect(f.session.getCapabilities().messages.file).toBe(true);
+    const bytes = Buffer.from("authenticated media only"); const request = f.request();
+    const { mediaId } = f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: request.operationId,
+      conversation: request.conversation, media: { kind: "file", size: bytes.length }, sha256: createHash("sha256").update(bytes).digest("hex") });
+    f.session.mediaWrite({ connectionEpoch: 1, mediaId, offset: 0, data: bytes.toString("base64") });
+    expect((await f.session.send({ ...request, parts: [{ kind: "file", mediaId }] })).outcome).toBe("sent");
+    expect(f.actions.some((action) => action.action === "upload_file_stream" && action.params.chunk_data === bytes.toString("base64"))).toBe(true);
+    expect(received).not.toHaveBeenCalled();
+  });
+
   it('releases every downloaded handle when normalized placeholders exceed the text limit', async () => {
     const f = await mediaFixture();
     // Keep one successful event alive to detect over-broad cleanup.

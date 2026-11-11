@@ -46,6 +46,14 @@ try {
     allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true,
   }, credentials: { accessToken: "smoke-token" } }), /Failed: initialize: invalid-request/);
   await assert.rejects(request("start", {}), /Failed: start: not-initialized/);
+  for (const accessToken of ["", " \t ", "\u00a0\u3000\ufeff"]) {
+    await assert.rejects(request("initialize", { config: {
+      configRevision: 1, listen: { host: "127.0.0.1", port }, expectedSelfId: "10001",
+      allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true,
+    }, credentials: { accessToken } }), /Failed: initialize: invalid-request/);
+    await assert.rejects(request("start", {}), /Failed: start: not-initialized/);
+    await request("ping", {});
+  }
   const initialized = await request("initialize", { config: {
     configRevision: 1, listen: { host: "127.0.0.1", port }, expectedSelfId: "10001",
     allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true,
@@ -92,7 +100,7 @@ try {
   assert.equal(await exited, 0);
   clearTimeout(timeout);
   assert.equal(stderr, "");
-  console.log("PASS: compiled private IPC + non-loopback rejection + malformed backend recovery + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
+  console.log("PASS: compiled private IPC + non-loopback/blank-token rejection + malformed backend recovery + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
 } finally {
   malformed?.terminate();
   ws?.terminate();

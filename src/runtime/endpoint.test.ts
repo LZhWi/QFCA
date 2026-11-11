@@ -39,6 +39,34 @@ describe("QqProtocolEndpoint", () => {
     expect(JSON.stringify(output)).not.toContain("secret");
     await endpoint.close();
   });
+  it.each(["", " ", "\t", "\u00a0\u3000\ufeff"])("rejects a blank credential without advertising capabilities and permits correction: %j", async (accessToken) => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", { ...initialize, credentials: { accessToken } }));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "invalid-request" } });
+    expect(output).not.toContainEqual(expect.objectContaining({ event: "capabilities" }));
+    await endpoint.receive(request("start", {}));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "not-initialized" } });
+    await endpoint.receive(request("initialize", initialize, "corrected"));
+    expect(output.at(-1)).toMatchObject({ responseTo: "corrected", ok: true });
+    expect(JSON.stringify(output)).not.toContain("secret");
+    await endpoint.close();
+  });
+  it.each(["", " \t ", "\u00a0\u3000"])("does not advertise media after blank-token initialization: %j", async (accessToken) => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", { ...initialize, credentials: { accessToken }, mediaTransfer: "chunked-v1" }));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "invalid-request" } });
+    await endpoint.receive(request("start", {}));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "not-initialized" } });
+    expect(output.some((value) => value.kind === "event")).toBe(false);
+    await endpoint.receive(request("initialize", { ...initialize, mediaTransfer: "chunked-v1" }, "corrected-media"));
+    expect(output.at(-1)).toMatchObject({ ok: true, payload: { capabilities: { messages: { image: false, file: false } } } });
+    expect(JSON.stringify(output)).not.toContain("secret");
+    await endpoint.close();
+  });
   it("never executes a replay after a busy terminal response", async () => {
     const output: QqEnvelope[] = [];
     const endpoint = new QqProtocolEndpoint((value) => output.push(value));
