@@ -150,17 +150,32 @@ export class QqOneBotSession {
       // The receive chain is serial, so even duplicates queued during the first
       // download are dropped before allocating any new media handles.
       if (this.seen.has(eventId)) return;
-      const message = await normalizeOneBotMessage(value, {
-        selfId: this.config.expectedSelfId, connectionEpoch: epoch,
-        configRevision: this.config.configRevision, client,
-        ...(this.capabilities.backend.napcatStream ? { resolveMedia: (segment: OneBotSegment, eventId: string) => downloadMedia(client, this.spool, epoch, eventId, segment, () => {
-          if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) throw new Error("Stale media connection");
-        }) } : {}),
-      });
-      if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) return;
-      if (this.seen.size >= 4096) this.seen.delete(this.seen.keys().next().value!);
-      this.seen.set(message.eventId, Date.now() + 10 * 60_000);
-      await this.options.onInbound(message);
+      // Until successful host delivery, this receive owns every resolved handle.
+      // Normalization may fail after downloads (for example placeholder overflow).
+      const downloaded: string[] = [];
+      let delivered = false;
+      try {
+        const message = await normalizeOneBotMessage(value, {
+          selfId: this.config.expectedSelfId, connectionEpoch: epoch,
+          configRevision: this.config.configRevision, client,
+          ...(this.capabilities.backend.napcatStream ? { resolveMedia: async (segment: OneBotSegment, eventId: string) => {
+            const media = await downloadMedia(client, this.spool, epoch, eventId, segment, () => {
+              if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) throw new Error("Stale media connection");
+            });
+            downloaded.push(media.mediaId);
+            return media;
+          } } : {}),
+        });
+        if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) return;
+        if (this.seen.size >= 4096) this.seen.delete(this.seen.keys().next().value!);
+        this.seen.set(message.eventId, Date.now() + 10 * 60_000);
+        await this.options.onInbound(message);
+        delivered = true;
+      } finally {
+        if (!delivered) for (const mediaId of downloaded) {
+          try { this.spool.release(epoch, mediaId); } catch { /* already revoked by disconnect/stop */ }
+        }
+      }
     });
     this.receiveChain = next.catch(() => undefined);
     return next;

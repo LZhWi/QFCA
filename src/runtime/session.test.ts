@@ -221,6 +221,29 @@ async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolea
 }
 
 describe('NapCat media session', () => {
+  it('releases every downloaded handle when normalized placeholders exceed the text limit', async () => {
+    const f = await mediaFixture();
+    // Keep one successful event alive to detect over-broad cleanup.
+    f.socket.send(JSON.stringify(f.message({ message: [{ type: 'image', data: { file: 'kept' } }] })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    f.socket.send(JSON.stringify(f.message({ message_id: 5002, message: [
+      { type: 'text', data: { text: 'x'.repeat(32768) } },
+      { type: 'image', data: { file: 'first' } },
+      { type: 'image', data: { file: 'second' } },
+      { type: 'face', data: { id: '1' } },
+    ] })));
+    // Serial receive barrier proves the invalid event has finished.
+    f.socket.send(JSON.stringify(f.message({ message_id: 5003 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(f.actions.filter((a) => a.action.startsWith('download_file_'))).toHaveLength(3);
+    const kept = f.inbound[0];
+    expect(f.session.mediaRead({ connectionEpoch: 1, eventId: kept.eventId, mediaId: kept.attachments![0].mediaId, offset: 0, limit: 65536 }).eof).toBe(true);
+    const reservations = Array.from({ length: 255 }, (_, i) => f.session.mediaBeginUpload({
+      connectionEpoch: 1, operationId: `cleanup_${i}`,
+      conversation: { type: 'private', peerId: '10002' }, media: { kind: 'file', size: 1 }, sha256: '0'.repeat(64),
+    }));
+    for (const reservation of reservations) f.session.mediaRelease({ connectionEpoch: 1, ...reservation });
+  });
   it('deduplicates media before downloading and preserves capacity for other transfers', async () => {
     const f = await mediaFixture();
     const message = f.message({ message: [{ type: 'image', data: { file: 'opaque-image' } }] });
@@ -317,4 +340,28 @@ describe('NapCat media session', () => {
     expect((await f.session.send({ ...req, parts: [{ kind: 'file', mediaId }] })).outcome).toBe('failed');
     expect(f.actions.filter((a) => a.action.startsWith('send_'))).toHaveLength(0);
   });
+});
+
+it('host rejection releases all current media and preserves earlier delivery', async () => {
+ const f = await fixture(napcatFake(), '10001', async m => { if(m.backendMessageId === '5002') throw new Error('host reject'); }, {mediaTransfer:'chunked-v1'});
+ await vi.waitFor(() => expect(f.session.getCapabilities().backend.napcatStream).toBe(true));
+ for (const id of [5001, 5002]) f.socket.send(JSON.stringify(f.message({message_id:id,message:[{type:'image',data:{file:'a'}},{type:'image',data:{file:'b'}}]})));
+ f.socket.send(JSON.stringify(f.message({message_id:5003})));
+ await vi.waitFor(() => expect(f.inbound).toHaveLength(3));
+ for (const a of f.inbound[0].attachments!) expect(f.session.mediaRead({connectionEpoch:1,mediaId:a.mediaId,eventId:f.inbound[0].eventId,offset:0,limit:65536}).eof).toBe(true);
+ for (const a of f.inbound[1].attachments!) expect(() => f.session.mediaRead({connectionEpoch:1,mediaId:a.mediaId,eventId:f.inbound[1].eventId,offset:0,limit:65536})).toThrow();
+ const reserved = Array.from({length:254},(_,i) => f.session.mediaBeginUpload({connectionEpoch:1,operationId:`qa_${i}`,conversation:{type:'private',peerId:'10002'},media:{kind:'file',size:1},sha256:'0'.repeat(64)}));
+ for(const r of reserved) f.session.mediaRelease({connectionEpoch:1,...r});
+});
+it('quiesce during second download releases earlier and partial handles', async () => {
+ let quiesce: (()=>void)|undefined;
+ let downloads = 0;
+ const f = await mediaFixture((a) => {if(a.action.startsWith('download_file_') && ++downloads === 2) quiesce!(); return false;});
+ quiesce = () => f.session.quiesce();
+ f.socket.send(JSON.stringify(f.message({message:[{type:'image',data:{file:'a'}},{type:'image',data:{file:'b'}}]})));
+ await vi.waitFor(() => expect(downloads).toBe(2));
+ await (f.session as any).receiveChain;
+ expect(f.inbound).toHaveLength(0);
+ const reserved = Array.from({length:256},(_,i) => f.session.mediaBeginUpload({connectionEpoch:1,operationId:`qa_${i}`,conversation:{type:'private',peerId:'10002'},media:{kind:'file',size:1},sha256:'0'.repeat(64)}));
+ for(const r of reserved) f.session.mediaRelease({connectionEpoch:1,...r});
 });
