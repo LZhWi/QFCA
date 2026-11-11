@@ -106,7 +106,7 @@ describe("OneBotActionClient", () => {
     client.handleResponse({ status: "ok", retcode: 0, data: { type: "stream", data_type: "file_chunk", index: 2 }, echo: request.echo });
     client.handleResponse({ status: "ok", retcode: 0, data: { type: "response", data_type: "file_complete" }, echo: request.echo });
     await expect(pending).rejects.toThrow("chunk handler failed");
-    expect(seen).toEqual([0, 1, 2]);
+    expect(seen).toEqual([0, 1]); // Abort immediately; never process attacker-controlled later chunks.
     expect(client.pendingCount).toBe(0);
   });
 
@@ -121,4 +121,25 @@ describe("OneBotActionClient", () => {
     client.handleResponse({ status: "ok", retcode: 0, data: { type: "reset" }, echo: request.echo });
     await expect(pending).rejects.toThrow("duplicate file_info");
   });
+});
+
+it('accepts a bounded burst of more than eight download chunks', async () => {
+  const socket = new FakeSocket(); const client = new OneBotActionClient(socket as unknown as WebSocket);
+  const seen: number[] = [];
+  const pending = client.callStream('download_file_stream', {}, (packet) => { if (packet.index !== undefined) seen.push(packet.index); });
+  const { echo } = requestAt(socket, 0);
+  for (let index = 0; index < 20; index++) client.handleResponse({ status: 'ok', retcode: 0, echo, data: { type: 'stream', index, data: Buffer.alloc(65536).toString('base64') } });
+  client.handleResponse({ status: 'ok', retcode: 0, echo, data: { type: 'response' } });
+  await pending; expect(seen).toHaveLength(20); expect(client.pendingCount).toBe(0);
+});
+it('bounds queued packets and does not execute queued callbacks after disconnect', async () => {
+  const socket = new FakeSocket(); const client = new OneBotActionClient(socket as unknown as WebSocket);
+  let seen = 0; const pending = client.callStream('download_file_stream', {}, () => { seen++; });
+  const { echo } = requestAt(socket, 0);
+  for (let index = 0; index < 129; index++) client.handleResponse({ status: 'ok', retcode: 0, echo, data: { type: 'stream', index } });
+  await expect(pending).rejects.toThrow('overloaded'); expect(seen).toBe(0);
+  const second = client.callStream('download_file_stream', {}, () => { seen++; });
+  const next = requestAt(socket, 1);
+  client.handleResponse({ status: 'ok', retcode: 0, echo: next.echo, data: { type: 'stream' } });
+  client.rejectAll(); await expect(second).rejects.toThrow('closed'); expect(seen).toBe(0);
 });

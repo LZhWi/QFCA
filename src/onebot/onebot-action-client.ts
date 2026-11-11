@@ -10,6 +10,7 @@ interface PendingAction {
   onPacket?: (packet: OneBotStreamPacket) => void | Promise<void>;
   packetChain: Promise<void>;
   terminalReceived: boolean;
+  queuedPackets: number;
   /** 流回调抛出的首个错误；接链时捕获，terminal 包到达时统一 reject，避免 rejected promise 无人处理导致 unhandledRejection 崩溃主进程。 */
   packetError?: Error;
 }
@@ -34,6 +35,7 @@ export class OneBotTransportError extends Error {
 
 export class OneBotActionClient {
   private pending = new Map<string, PendingAction>();
+  private queuedStreamBytes = 0;
 
   constructor(
     private readonly socket: WebSocket,
@@ -83,13 +85,19 @@ export class OneBotActionClient {
     }
 
     const packet = response.data as OneBotStreamPacket;
+    const packetBytes = packet && typeof packet === "object" ? Buffer.byteLength(JSON.stringify(packet)) : 0;
+    if (!packetBytes || pending.queuedPackets >= 128 || this.queuedStreamBytes + packetBytes > 8 * 1024 * 1024) {
+      this.finish(response.echo); pending.reject(new OneBotTransportError("overloaded")); return true;
+    }
+    pending.queuedPackets++; this.queuedStreamBytes += packetBytes;
     // 接链时捕获回调异常：NapCat 不会因客户端回调失败而停发后续包，
     // 若不在链上兜底，每个后续包都会产生一个无 handler 的 rejected promise（unhandledRejection → 主进程崩溃）。
     pending.packetChain = pending.packetChain
-      .then(() => pending.onPacket?.(packet))
+      .then(() => { if (this.pending.get(response.echo!) === pending) return pending.onPacket?.(packet); })
       .catch((error) => {
         pending.packetError ??= error instanceof Error ? error : new Error(String(error));
-      });
+        this.finish(response.echo!); pending.reject(pending.packetError);
+      }).finally(() => { pending.queuedPackets--; this.queuedStreamBytes -= packetBytes; });
     if (packet?.type === "response") {
       pending.terminalReceived = true;
       void pending.packetChain.then(() => {
@@ -145,6 +153,7 @@ export class OneBotActionClient {
         onPacket,
         packetChain: Promise.resolve(),
         terminalReceived: false,
+        queuedPackets: 0,
       });
       try {
         this.socket.send(JSON.stringify({ action, params, echo }));

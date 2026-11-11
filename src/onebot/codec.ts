@@ -2,7 +2,7 @@
 // Upstream attribution and license are retained in LICENSES/Cyrene-Agent-MIT.txt.
 import { createHash } from "node:crypto";
 import { QQ_CONTRACT_LIMITS, validateInboundMessage } from "../contract";
-import type { QqInboundMessageV1, QqMention, QqReply, QqSendRequestV1 } from "../contract";
+import type { QqInboundMessageV1, QqMention, QqReply, QqSendRequestV1, QqMedia } from "../contract";
 import { isBoundedJson } from "../contract/validation";
 import type { OneBotMessageEvent, OneBotSegment } from "./onebot-types";
 
@@ -19,6 +19,7 @@ export interface OneBotNormalizerContext {
   configRevision: number;
   client: ActionClient;
   now?: () => number;
+  resolveMedia?: (segment: OneBotSegment, eventId: string) => Promise<QqMedia>;
 }
 
 function invalid(): never { throw new Error(INVALID_MESSAGE); }
@@ -166,6 +167,8 @@ export async function normalizeOneBotMessage(
   }
   // Validate every segment before making any enrichment calls.
   const message = segments(event.message);
+  const eventId = `onebot_${createHash("sha256").update(JSON.stringify([selfId, conversation, backendMessageId])).digest("hex")}`;
+  const attachments: QqMedia[] = [];
   const mentions: QqMention[] = [];
   const textParts: string[] = [];
   let reply: QqReply | undefined;
@@ -189,7 +192,10 @@ export async function normalizeOneBotMessage(
     } else if (segment.type === "reply") {
       if (!reply) reply = await resolveReply(context.client, id(segment.data.id));
     } else if (MEDIA_TYPES.has(segment.type)) {
-      textParts.push(`[附件未启用:${segment.type}]`);
+      if (context.resolveMedia && attachments.length < QQ_CONTRACT_LIMITS.maxAttachments) {
+        try { attachments.push(await context.resolveMedia(segment, eventId)); }
+        catch { textParts.push(`[附件不可用:${segment.type}]`); }
+      } else textParts.push(`[附件未启用:${segment.type}]`);
     } else if (segment.type === "face") {
       textParts.push(`[QQ表情:${segment.data.id === undefined ? "" : id(segment.data.id)}]`);
     } else if (segment.type === "json") {
@@ -198,12 +204,11 @@ export async function normalizeOneBotMessage(
       textParts.push(`[未支持的消息类型:${segment.type}]`);
     }
   }
-  const eventId = `onebot_${createHash("sha256")
-    .update(JSON.stringify([selfId, conversation, backendMessageId])).digest("hex")}`;
   const result: QqInboundMessageV1 = {
     eventId, backendMessageId, selfId, connectionEpoch, configRevision, conversation, senderId, timestampMs,
     // raw_message can contain CQ media paths and is deliberately never forwarded.
-    text: textParts.join("").trim() || "[空消息]",
+    text: textParts.join("").trim() || (attachments.length ? "" : "[空消息]"),
+    ...(attachments.length ? { attachments } : {}),
     ...(name ? { senderName: name } : {}),
     ...(mentions.length ? { mentions } : {}),
     ...(reply ? { reply } : {}),

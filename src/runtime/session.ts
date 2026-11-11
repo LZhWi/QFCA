@@ -1,15 +1,18 @@
 import {
   validateSendRequest, validateSendResult, validateRuntimeConfig, validateCapabilitySnapshot,
-  QQ_RUNTIME_TIMEOUTS,
+  QQ_RUNTIME_TIMEOUTS, validateMediaBeginUpload, validateMediaWrite, validateMediaRead, validateMediaRelease,
+  type QqMediaBeginUpload, type QqMediaWrite, type QqMediaRead, type QqMediaRelease,
   type QqRuntimeConfig, type QqBackendStatus, type QqInboundMessageV1,
   type QqSendRequestV1, type QqSendResultV1, type QqCapabilitySnapshot, type QqPartResult,
 } from "../contract";
+import { MediaSpool } from "./media-spool";
+import { probeMedia, uploadMedia, downloadMedia } from "../onebot/media";
 import { OneBotActionClient, OneBotActionError, OneBotTransportError } from "../onebot/onebot-action-client";
 import { OneBotReverseWsServer, type OneBotListeningInfo } from "../onebot/onebot-reverse-ws";
 import { isOneBotMessageEvent, oneBotId, type OneBotSegment } from "../onebot/onebot-types";
 import { isQqEventAllowed, normalizeOneBotMessage, splitQqText } from "../onebot/codec";
 
-/** Media stays disabled until a host-owned media broker and backend probe exist. */
+/** Fail-closed baseline; per-connection probes may enable NapCat media. */
 export const TEXT_CAPABILITIES: QqCapabilitySnapshot = {
   messages: { text: true, image: false, audio: false, file: false, video: false, markdown: false,
     card: false, sticker: false, reply: true, mention: true, maxTextLength: 32768, maxFileBytes: 0 },
@@ -19,7 +22,9 @@ export interface QqSessionOptions {
   config: QqRuntimeConfig;
   accessToken: string;
   runtimeEpoch: number;
+  mediaTransfer?: "chunked-v1";
   onInbound: (message: QqInboundMessageV1) => void | Promise<void>;
+  onCapabilities?: (capabilities: QqCapabilitySnapshot) => void;
   onStatus?: (status: QqBackendStatus) => void;
   onDiagnostic?: (code: "transport" | "handshake" | "event" | "overloaded") => void;
   /** Test controls, not exposed through IPC. */
@@ -44,6 +49,8 @@ export class QqOneBotSession {
   private queuedSends = 0;
   private seen = new Map<string, number>();
   private operations = new Set<string>();
+  private readonly spool = new MediaSpool();
+  private capabilities = structuredClone(TEXT_CAPABILITIES);
 
   constructor(private readonly options: QqSessionOptions) {
     if (!validateRuntimeConfig(options.config) || !Number.isSafeInteger(options.runtimeEpoch) || options.runtimeEpoch < 0) {
@@ -60,15 +67,26 @@ export class QqOneBotSession {
       ...this.config.listen, accessToken: options.accessToken, expectedSelfId: this.config.expectedSelfId,
       actionTimeoutMs: options.actionTimeoutMs,
       onClientConnected: async (client, selfId) => {
+        this.spool.revoke();
+        this.capabilities = structuredClone(TEXT_CAPABILITIES);
+        this.options.onCapabilities?.(this.capabilities);
         const generation = this.generation;
         const login = await client.call<{ user_id?: unknown }>("get_login_info");
         if (!login || oneBotId(login.user_id) !== selfId) throw new Error("QQ account mismatch");
         if (!this.running || generation !== this.generation || this.server.client !== client) return;
         this.client = client;
         this.connectionEpoch++;
-        this.setStatus({ phase: "running", selfId, connectionEpoch: this.connectionEpoch });
+        const epoch = this.connectionEpoch;
+        const check = () => { if (!this.running || generation !== this.generation || this.server.client !== client || epoch !== this.connectionEpoch) throw new Error("Stale media connection"); };
+        this.setStatus({ phase: "running", selfId, connectionEpoch: epoch });
+        // Text becomes ready without waiting for optional extensions. An old probe
+        // must not overwrite capabilities after stop or a newer connection.
+        if (this.options.mediaTransfer === "chunked-v1") void probeMedia(client, TEXT_CAPABILITIES, check).then((capabilities) => {
+          check(); this.capabilities = capabilities;
+          this.options.onCapabilities?.(structuredClone(capabilities));
+        }).catch(() => undefined);
       },
-      onClientDisconnected: () => { this.client = null; this.setStatus({ phase: "waiting-backend" }); },
+      onClientDisconnected: () => { this.spool.revoke(); this.capabilities = structuredClone(TEXT_CAPABILITIES); this.options.onCapabilities?.(structuredClone(this.capabilities)); this.client = null; this.setStatus({ phase: "waiting-backend" }); },
       onEvent: (event, client) => this.receive(event, client),
       onError: (code) => options.onDiagnostic?.(code),
     });
@@ -78,6 +96,7 @@ export class QqOneBotSession {
     this.status = status;
     this.options.onStatus?.(structuredClone(status));
   }
+  getCapabilities(): QqCapabilitySnapshot { return structuredClone(this.capabilities); }
   getStatus(): QqBackendStatus { return structuredClone(this.status); }
   get info(): OneBotListeningInfo | null { return this.server.info; }
   start(): Promise<QqBackendStatus> {
@@ -99,6 +118,9 @@ export class QqOneBotSession {
     // Invalidate work immediately, even if start() is still awaiting bind.
     this.accepting = false;
     this.generation++;
+    this.spool.revoke();
+    this.capabilities = structuredClone(TEXT_CAPABILITIES);
+    this.options.onCapabilities?.(structuredClone(this.capabilities));
     const next = this.lifecycle.then(async () => {
       this.running = false;
       this.accepting = false;
@@ -125,6 +147,9 @@ export class QqOneBotSession {
       const message = await normalizeOneBotMessage(value, {
         selfId: this.config.expectedSelfId, connectionEpoch: epoch,
         configRevision: this.config.configRevision, client,
+        ...(this.capabilities.backend.napcatStream ? { resolveMedia: (segment: OneBotSegment, eventId: string) => downloadMedia(client, this.spool, epoch, eventId, segment, () => {
+          if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) throw new Error("Stale media connection");
+        }) } : {}),
       });
       if (!this.accepting || generation !== this.generation || epoch !== this.connectionEpoch || this.server.client !== client) return;
       const now = Date.now();
@@ -136,6 +161,28 @@ export class QqOneBotSession {
     });
     this.receiveChain = next.catch(() => undefined);
     return next;
+  }
+  private checkMediaEpoch(epoch: number): void {
+    if (!this.running || !this.client || this.server.client !== this.client || epoch !== this.connectionEpoch || !this.capabilities.backend.napcatStream) throw new Error("Media unavailable");
+  }
+  mediaBeginUpload(value: QqMediaBeginUpload): { mediaId: string } {
+    if (!validateMediaBeginUpload(value)) throw new Error("Invalid media request");
+    this.checkMediaEpoch(value.connectionEpoch);
+    const allowed = value.conversation.type === "group" ? this.config.allowedGroupIds.includes(value.conversation.groupId) : this.config.allowedPrivateUserIds.includes(value.conversation.peerId);
+    if (!allowed || this.operations.has(value.operationId) || !this.capabilities.messages[value.media.kind]) throw new Error("Media rejected");
+    return this.spool.begin(value);
+  }
+  mediaWrite(value: QqMediaWrite): Record<string, never> {
+    if (!validateMediaWrite(value)) throw new Error("Invalid media request");
+    this.checkMediaEpoch(value.connectionEpoch); this.spool.write(value.connectionEpoch, value.mediaId, value.offset, value.data); return {};
+  }
+  mediaRead(value: QqMediaRead) {
+    if (!validateMediaRead(value)) throw new Error("Invalid media request");
+    this.checkMediaEpoch(value.connectionEpoch); return this.spool.read(value.connectionEpoch, value.mediaId, value.eventId, value.offset, value.limit);
+  }
+  mediaRelease(value: QqMediaRelease): Record<string, never> {
+    if (!validateMediaRelease(value)) throw new Error("Invalid media request");
+    this.checkMediaEpoch(value.connectionEpoch); this.spool.release(value.connectionEpoch, value.mediaId); return {};
   }
   send(value: unknown): Promise<QqSendResultV1> {
     if (!validateSendRequest(value)) return Promise.reject(new Error("Invalid QQ send request"));
@@ -163,7 +210,10 @@ export class QqOneBotSession {
     const results: QqPartResult[] = [];
     let firstPayload = true;
     for (const [partIndex, part] of request.parts.entries()) {
-      if (part.kind !== "text") { results.push({ partIndex, outcome: "failed", errorCode: "unsupported" }); continue; }
+      if (part.kind !== "text") {
+        const result = await this.sendMedia(request, part, partIndex, client, generation, deadline, firstPayload);
+        results.push(result); if (result.outcome !== "failed") firstPayload = false; continue;
+      }
       const chunks = splitQqText(part.text);
       if (!chunks.length) { results.push({ partIndex, outcome: "failed", errorCode: "rejected" }); continue; }
       let sent = 0;
@@ -210,6 +260,40 @@ export class QqOneBotSession {
       results.push(failed ?? { partIndex, outcome: "sent", messageId: lastMessageId! });
     }
     return this.result(request, results);
+  }
+  private async sendMedia(request: QqSendRequestV1, part: QqSendRequestV1["parts"][number], partIndex: number, client: OneBotActionClient, generation: number, deadline: number, firstPayload: boolean): Promise<QqPartResult> {
+    if (part.kind === "text" || part.kind === "card" || !this.capabilities.messages[part.kind]) return { partIndex, outcome: "failed", errorCode: "unsupported" };
+    const check = () => {
+      this.checkMediaEpoch(request.connectionEpoch);
+      if (this.client !== client || generation !== this.generation || performance.now() >= deadline) throw new Error("Stale media send");
+    };
+    let dispatched = false;
+    try {
+      check();
+      const source = this.spool.claim(request, part);
+      const filenameExtension = part.filename?.split('.').pop()?.toLowerCase();
+      const mimeExtension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/ogg': 'ogg', 'video/mp4': 'mp4', 'application/pdf': 'pdf' } as Record<string, string>)[part.mime ?? ''];
+      const extension = filenameExtension && /^[a-z0-9]{1,8}$/.test(filenameExtension) ? filenameExtension : mimeExtension ?? ({ image: 'png', sticker: 'png', audio: 'audio', video: 'mp4', file: 'bin' } as const)[part.kind];
+      const path = await uploadMedia(client, source, check, deadline, extension);
+      check();
+      const type = part.kind === "audio" ? "record" : part.kind === "sticker" ? "image" : part.kind;
+      const segments: OneBotSegment[] = [{ type, data: { file: path, ...(part.kind === "file" && part.filename ? { name: part.filename } : {}) } }];
+      if (firstPayload && request.conversation.type === "group" && request.replyContext) {
+        segments.unshift({ type: "reply", data: { id: request.replyContext.messageId } });
+        if (request.replyContext.mentionUserId) segments.splice(1, 0, { type: "at", data: { qq: request.replyContext.mentionUserId } }, { type: "text", data: { text: " " } });
+      }
+      dispatched = true;
+      const response = await client.call<{ message_id?: unknown }>(request.conversation.type === "group" ? "send_group_msg" : "send_private_msg", {
+        [request.conversation.type === "group" ? "group_id" : "user_id"]: request.conversation.type === "group" ? request.conversation.groupId : request.conversation.peerId,
+        message: segments,
+      }, Math.min(this.options.actionTimeoutMs ?? 30_000, Math.max(1, deadline - performance.now())));
+      const id = response && oneBotId(response.message_id);
+      if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return { partIndex, outcome: "unknown", errorCode: "internal" };
+      return { partIndex, outcome: "sent", messageId: id };
+    } catch (error) {
+      const known = error instanceof OneBotActionError || error instanceof OneBotTransportError && ["unavailable", "overloaded"].includes(error.code);
+      return { partIndex, outcome: dispatched && !known ? "unknown" : "failed", errorCode: error instanceof OneBotTransportError && error.code === "timeout" ? "timeout" : "rejected" };
+    } finally { try { this.spool.release(request.connectionEpoch, part.mediaId); } catch { /* already revoked */ } }
   }
   private result(request: QqSendRequestV1, parts: QqPartResult[]): QqSendResultV1 {
     const outcome = parts.some((p) => p.outcome === "unknown") ? "unknown"

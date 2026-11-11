@@ -14,7 +14,7 @@ async function freePort(): Promise<number> {
 type Action = { action: string; echo: string; params: Record<string, unknown> };
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(response?: (action: Action, socket: WebSocket) => boolean, selfId = "10001", onInbound?: (message: QqInboundMessageV1) => Promise<void>, controls: Pick<QqSessionOptions, "sendBudgetMs" | "sendDelayMs" | "actionTimeoutMs"> = {}) {
+async function fixture(response?: (action: Action, socket: WebSocket) => boolean, selfId = "10001", onInbound?: (message: QqInboundMessageV1) => Promise<void>, controls: Pick<QqSessionOptions, "sendBudgetMs" | "sendDelayMs" | "actionTimeoutMs" | "mediaTransfer"> = {}) {
   const inbound: QqInboundMessageV1[] = [];
   const config: QqRuntimeConfig = { configRevision: 3, listen: { host: "127.0.0.1", port: await freePort() },
     expectedSelfId: "10001", allowedPrivateUserIds: ["10002"], allowedGroupIds: ["20001"], groupRequireMention: true };
@@ -179,5 +179,102 @@ describe("QqOneBotSession", () => {
     const f = await fixture(undefined, "10001", undefined, { sendBudgetMs: 30, sendDelayMs: 100 });
     expect((await f.session.send(f.request([{ kind: "text", text: "字".repeat(1800) }]))).parts[0]).toMatchObject({ outcome: "unknown", errorCode: "timeout" });
     expect(f.actions.filter((a) => a.action.startsWith("send_"))).toHaveLength(1);
+  });
+});
+
+// Official NapCat stream shapes, with no QQ account or backend outside localhost.
+function napcatFake(hook?: (action: Action, socket: WebSocket) => boolean) {
+  const uploads = new Map<string, { hash: string; size: number; chunks: number; received: number }>();
+  return (action: Action, socket: WebSocket): boolean => {
+    if (hook?.(action, socket)) return true;
+    const reply = (data: unknown) => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: action.echo, data })); };
+    if (action.action === 'get_version_info') reply({ app_name: 'NapCat.Onebot' });
+    else if (action.action === 'can_send_image' || action.action === 'can_send_record') reply({ yes: true });
+    else if (action.action === 'test_download_stream') {
+      for (let i = 1; i <= 10; i++) reply({ type: 'stream', data_type: 'data_chunk', data: `Index-> ${i}` });
+      reply({ type: 'response', data_type: 'data_complete', data: 'Stream transmission complete' });
+    } else if (action.action === 'upload_file_stream') {
+      const p = action.params; const id = String(p.stream_id);
+      if (p.reset) { reply({ type: 'reset' }); return true; }
+      if (p.is_complete) {
+        const entry = uploads.get(id)!;
+        reply({ type: 'response', status: 'file_complete', stream_id: id, file_size: entry.size, sha256: entry.hash, file_path: `/fake/backend/${id}.bin` });
+      } else {
+        const entry = uploads.get(id) ?? { hash: String(p.expected_sha256), size: Number(p.file_size), chunks: Number(p.total_chunks), received: 0 };
+        entry.received++; uploads.set(id, entry);
+        reply({ type: 'stream', status: 'chunk_received', stream_id: id, received_chunks: entry.received, total_chunks: entry.chunks });
+      }
+    } else if (action.action.startsWith('download_file_')) {
+      const data = Buffer.from('download bytes');
+      reply({ type: 'stream', data_type: 'file_info', file_name: 'media.png', file_size: data.length, chunk_size: 65536 });
+      reply({ type: 'stream', data_type: 'file_chunk', index: 0, size: data.length, data: data.toString('base64') });
+      reply({ type: 'response', data_type: 'file_complete', total_chunks: 1, total_bytes: data.length });
+    } else return false;
+    return true;
+  };
+}
+
+async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolean) {
+  const f = await fixture(napcatFake(hook), "10001", undefined, { mediaTransfer: "chunked-v1" });
+  await vi.waitFor(() => expect(f.session.getCapabilities().backend.napcatStream).toBe(true));
+  return f;
+}
+
+describe('NapCat media session', () => {
+  it('probes without sends, downloads bounded media handles, preserves text and never exposes paths', async () => {
+    const f = await mediaFixture();
+    expect(f.actions.filter((a) => a.action.startsWith('send_'))).toHaveLength(0);
+    f.socket.send(JSON.stringify(f.message({ message: [{ type: 'text', data: { text: 'keep me' } }, { type: 'image', data: { file: 'opaque-id.image', url: 'http://private/' } }] })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    const msg = f.inbound[0]; expect(msg.text).toBe('keep me');
+    expect(msg.attachments).toHaveLength(1);
+    expect(msg.attachments![0]).toMatchObject({ kind: 'image', filename: 'media.png', mime: 'image/png' });
+    expect(JSON.stringify(msg)).not.toMatch(/fake\/backend|http:|opaque-id/);
+    const mediaId = msg.attachments![0].mediaId;
+    expect(f.session.mediaRead({ connectionEpoch: 1, eventId: msg.eventId, mediaId, offset: 0, limit: 65536 })).toEqual({ data: Buffer.from('download bytes').toString('base64'), eof: true });
+    expect(() => f.session.mediaRead({ connectionEpoch: 1, eventId: 'other', mediaId, offset: 0, limit: 65536 })).toThrow();
+    f.session.mediaRelease({ connectionEpoch: 1, mediaId });
+  });
+  it('uploads request-bound media and rejects replay, then clears handles on disconnect', async () => {
+    const { createHash } = await import('node:crypto'); const f = await mediaFixture();
+    const bytes = Buffer.from('send bytes'); const req = f.request();
+    const uploaded = f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: req.operationId, conversation: req.conversation, media: { kind: 'image', size: bytes.length }, sha256: createHash('sha256').update(bytes).digest('hex') });
+    f.session.mediaWrite({ connectionEpoch: 1, mediaId: uploaded.mediaId, offset: 0, data: bytes.toString('base64') });
+    req.parts = [{ kind: 'image', mediaId: uploaded.mediaId }];
+    expect((await f.session.send(req)).outcome).toBe('sent');
+    expect((await f.session.send(req)).outcome).toBe('failed');
+    const send = f.actions.find((a) => a.action === 'send_private_msg')!;
+    expect(JSON.stringify(send.params)).toContain('/fake/backend/');
+    expect(JSON.stringify(send.params)).not.toContain(uploaded.mediaId);
+    const next = f.request(); const pending = f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: next.operationId, conversation: next.conversation, media: { kind: 'file', size: bytes.length }, sha256: createHash('sha256').update(bytes).digest('hex') });
+    f.socket.close(); await vi.waitFor(() => expect(f.session.getStatus().phase).toBe('waiting-backend'));
+    expect(() => f.session.mediaWrite({ connectionEpoch: 1, mediaId: pending.mediaId, offset: 0, data: bytes.toString('base64') })).toThrow();
+  });
+  it('does not download path/URL input and retains safe text with a placeholder', async () => {
+    const f = await mediaFixture();
+    const bad = ['file:///etc/passwd', '/tmp/file', '../secret', './file', 'https://example.com', 'C:\\secret'];
+    f.socket.send(JSON.stringify(f.message({ message: [{ type: 'text', data: { text: 'safe' } }, ...bad.map((file) => ({ type: 'image', data: { file } }))] })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    expect(f.inbound[0].text).toBe('safe' + '[附件不可用:image]'.repeat(bad.length));
+    expect(f.actions.filter((a) => a.action.startsWith('download_file'))).toHaveLength(0);
+  });
+  it('failed stream probe cannot advertise media or emit media sends', async () => {
+    const f = await fixture(napcatFake((action, socket) => {
+      if (action.action !== 'test_download_stream') return false;
+      socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: action.echo, data: { type: 'response', data_type: 'data_complete' } })); return true;
+    }), '10001', undefined, { mediaTransfer: 'chunked-v1' });
+    expect((await f.session.send(f.request([{ kind: 'image', mediaId: 'fake' }]))).parts[0]).toMatchObject({ outcome: 'failed', errorCode: 'unsupported' });
+    expect(f.actions.some((a) => a.action === 'upload_file_stream')).toBe(false);
+  });
+  it('disconnect during backend upload cannot dispatch a send on either connection', async () => {
+    const { createHash } = await import('node:crypto'); let uploads = 0;
+    const f = await mediaFixture((action, socket) => {
+      if (action.action === 'upload_file_stream' && action.params.chunk_data && ++uploads === 2) { socket.close(); return true; } return false;
+    });
+    const req = f.request(); const data = Buffer.from('outbound');
+    const { mediaId } = f.session.mediaBeginUpload({ connectionEpoch: 1, operationId: req.operationId, conversation: req.conversation, media: { kind: 'file', size: data.length }, sha256: createHash('sha256').update(data).digest('hex') });
+    f.session.mediaWrite({ connectionEpoch: 1, mediaId, offset: 0, data: data.toString('base64') });
+    expect((await f.session.send({ ...req, parts: [{ kind: 'file', mediaId }] })).outcome).toBe('failed');
+    expect(f.actions.filter((a) => a.action.startsWith('send_'))).toHaveLength(0);
   });
 });
