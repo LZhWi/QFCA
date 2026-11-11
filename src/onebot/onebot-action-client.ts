@@ -68,11 +68,13 @@ export class OneBotActionClient {
     if (typeof response.retcode !== "number" || !Number.isSafeInteger(response.retcode)) return false;
     if (response.status !== "ok" && response.status !== "failed") return false;
     if (response.status === "failed" || response.retcode !== 0) {
+      // Backend JSON is untrusted despite the protocol type assertion. Never
+      // coerce an object to an Error message or orphan the pending promise.
+      const wording = typeof response.wording === "string" ? response.wording : "";
+      const message = typeof response.message === "string" ? response.message : "";
+      const error = new OneBotActionError(wording || message || `OneBot action failed (${response.retcode})`, response.retcode);
       this.finish(response.echo);
-      pending.reject(new OneBotActionError(
-        response.wording || response.message || `OneBot action failed (${response.retcode})`,
-        response.retcode,
-      ));
+      pending.reject(error);
       return true;
     }
 
