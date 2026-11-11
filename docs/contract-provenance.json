@@ -1,0 +1,15 @@
+{
+  "repository": "Playa-Cyrene/Cyrene-Agent",
+  "sourceDirectory": "src/shared/qq-module",
+  "baseCommit": "46b27ce9b95f3254621df2238d3bb97554edfefa",
+  "companionBranch": "feat/qq-module-host-runtime",
+  "status": "unpublished companion candidate; includes required send.connectionEpoch revision",
+  "sha256": {
+    "index.ts": "6e5db44e75de80394d6d60ed271ac989acc7ce4c067cd2e74c3512e6dff77b74",
+    "types.ts": "431639326b174a6b75b8561ecd48517f6e98e93253c122c4d404ada76b26fe62",
+    "validation.ts": "db41dafb3918ec32e070b038f4f624df813b0c65ffd38d82b545d4d2fd2af6f1",
+    "version.ts": "0dd2bc5423218aa84bfbcdc767591b63bb84efd4121c6d370fc2a602b0b2f36a",
+    "runtime.ts": "def58c3e21a2f4ae195828820d87f19595dfedf7c0e04196ba7d2ecc12ec9679",
+    "contract.test.ts": "3ba26b7bf9397476dd6c2aa93104adad41a1d07f68ec2fffbcef54078d702156"
+  }
+}

@@ -1,0 +1,80 @@
+import { describe, expect, it, vi } from "vitest";
+import { QqProtocolEndpoint } from "./endpoint";
+import type { QqEnvelope, QqMethod, QqRequestPayloads } from "../contract";
+
+function request<K extends QqMethod>(method: K, payload: QqRequestPayloads[K], id: string = method) {
+  return { kind: "request", apiVersion: { major: 1, minor: 0 }, instanceId: "instance", runtimeEpoch: 5,
+    requestId: id, method, payload };
+}
+const initialize = { config: { configRevision: 0, listen: { host: "127.0.0.1", port: 3001 }, expectedSelfId: "10001",
+  allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true }, credentials: { accessToken: "secret" } };
+describe("QqProtocolEndpoint", () => {
+  it("orders hello/initialize/start and rejects duplicate, extra-field and stale envelopes", async () => {
+    const output: QqEnvelope[] = [];
+    const start = vi.fn(async () => ({ phase: "waiting-backend" as const }));
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value), () => ({ start, stop: async () => undefined, quiesce: () => undefined, send: vi.fn() }));
+    expect(await endpoint.receive(request("start", {}))).toBe(false);
+    expect(output).toHaveLength(0);
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", initialize));
+    expect(JSON.stringify(output)).not.toContain("secret");
+    await endpoint.receive(request("start", {}, "start2"));
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(await endpoint.receive(request("start", {}, "start2"))).toBe(false);
+    expect(await endpoint.receive({ ...request("stop", {}), runtimeEpoch: 4 })).toBe(false);
+    expect(await endpoint.receive({ ...request("stop", {}), permissionMode: "trusted" })).toBe(false);
+    expect(await endpoint.receive({ ...request("stop", {}), apiVersion: { major: 1, minor: 1 } })).toBe(false);
+    await endpoint.close();
+  });
+  it("fails closed on invalid initialization and never starts a listener", async () => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", { ...initialize, config: { ...initialize.config, listen: { host: "0.0.0.0", port: 3001 } }, credentials: { accessToken: "" } }));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "invalid-request" } });
+    await endpoint.receive(request("start", {}));
+    expect(output.at(-1)).toMatchObject({ ok: false, error: { code: "not-initialized" } });
+    await endpoint.close();
+  });
+  it("never executes a replay after a busy terminal response", async () => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    const pending = Array.from({ length: 64 }, (_, i) => endpoint.receive(request("ping", {}, `ping_${i}`)));
+    const busy = request("ping", {}, "busy");
+    await endpoint.receive(busy);
+    await Promise.all(pending);
+    expect(await endpoint.receive(busy)).toBe(false);
+    expect(output.filter((v) => v.kind === "response" && v.responseTo === "busy")).toEqual([
+      expect.objectContaining({ ok: false, error: { code: "busy" } }),
+    ]);
+    await endpoint.close();
+  });
+  it("allows stop to interrupt a pending send instead of deadlocking behind it", async () => {
+    const output: QqEnvelope[] = [];
+    let resolveSend!: (v: unknown) => void;
+    const send = vi.fn(() => new Promise<any>((resolve) => { resolveSend = resolve; }));
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value), () => ({
+      start: async () => ({ phase: "waiting-backend" }), send, quiesce: () => undefined,
+      stop: async () => { resolveSend?.({ operationId: "op", outcome: "unknown", parts: [{ partIndex: 0, outcome: "unknown", errorCode: "disconnected" }] }); },
+    }));
+    await endpoint.receive(request("hello", {}));
+    await endpoint.receive(request("initialize", initialize));
+    await endpoint.receive(request("start", {}));
+    const pending = endpoint.receive(request("send", { operationId: "op", runtimeEpoch: 5, connectionEpoch: 1, selfId: "10001", conversation: { type: "private", peerId: "10002" }, parts: [{ kind: "text", text: "hi" }] }));
+    await endpoint.receive(request("stop", {}));
+    await pending;
+    expect(output.some((v) => v.kind === "response" && v.responseTo === "send" && v.ok)).toBe(true);
+    await endpoint.close();
+  });
+  it("closes visibly after the replay budget instead of silently hanging future stop/ping", async () => {
+    const output: QqEnvelope[] = [];
+    const endpoint = new QqProtocolEndpoint((value) => output.push(value));
+    await endpoint.receive(request("hello", {}));
+    for (let i = 0; i < 9999; i++) await endpoint.receive(request("ping", {}, `ping_${i}`));
+    await endpoint.receive(request("ping", {}, "exhausted"));
+    expect(output.at(-1)).toMatchObject({ responseTo: "exhausted", ok: false, error: { code: "busy" } });
+    expect(endpoint.isClosed).toBe(true);
+    expect(await endpoint.receive(request("ping", {}, "exhausted"))).toBe(false);
+  });
+});
