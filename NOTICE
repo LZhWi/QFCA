@@ -1,0 +1,19 @@
+QFCA
+Copyright (c) 2026 Zehao Liang
+
+The files under src/contract and the OneBot protocol implementation and tests
+under src/onebot are copied or adapted from Cyrene-Agent:
+https://github.com/Playa-Cyrene/Cyrene-Agent
+Source commit: 46b27ce9b95f3254621df2238d3bb97554edfefa (Draft PR #338)
+Copyright (c) 2026 Playa
+MIT License. The complete original notice and license are retained in
+LICENSES/Cyrene-Agent-MIT.txt and must accompany redistributed copies.
+
+src/contract/runtime.ts and the connectionEpoch send-field revision in types,
+validation, exports and tests are the coordinated Phase 2 host-runtime
+candidate, developed alongside this QFCA change. These revisions are not in
+the Phase 1 source commit above. Exact vendored file hashes are recorded in
+docs/contract-provenance.json and must stay in sync with the companion host PR.
+
+The contract is an unpublished API 1.0 candidate. Vendoring this source is not
+a declaration of compatibility with any released Cyrene-Agent version.
