@@ -40,6 +40,11 @@ let ws;
 try {
   const hello = await request("hello", {});
   assert.equal(hello.moduleId, "qfca");
+  await assert.rejects(request("initialize", { config: {
+    configRevision: 1, listen: { host: "0.0.0.0", port }, expectedSelfId: "10001",
+    allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true,
+  }, credentials: { accessToken: "smoke-token" } }), /Failed: initialize: invalid-request/);
+  await assert.rejects(request("start", {}), /Failed: start: not-initialized/);
   const initialized = await request("initialize", { config: {
     configRevision: 1, listen: { host: "127.0.0.1", port }, expectedSelfId: "10001",
     allowedPrivateUserIds: ["10002"], allowedGroupIds: [], groupRequireMention: true,
@@ -76,7 +81,7 @@ try {
   assert.equal(await exited, 0);
   clearTimeout(timeout);
   assert.equal(stderr, "");
-  console.log("PASS: compiled private IPC + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
+  console.log("PASS: compiled private IPC + non-loopback rejection + authenticated fake OneBot + inbound/send/quiesce/stop/disconnect");
 } finally {
   ws?.terminate();
   if (child.connected) child.disconnect();
