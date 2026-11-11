@@ -1,0 +1,25 @@
+{
+  "name": "qfca",
+  "version": "0.1.0-dev.0",
+  "private": true,
+  "description": "Cyrene 专属可选 QQ 模块开发基础（非普通插件）",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "LICENSE", "LICENSES", "NOTICE", "README.md", "docs/contract-provenance.json"],
+  "engines": {"node": ">=24 <25"},
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "smoke": "node scripts/smoke.mjs",
+    "verify": "npm run check && npm test && npm run build && npm run smoke"
+  },
+  "dependencies": {"ws": "8.21.0"},
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "@types/ws": "8.18.1",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  }
+}
