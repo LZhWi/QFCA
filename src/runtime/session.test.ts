@@ -1,8 +1,9 @@
 import { createServer } from "node:net";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import { QqOneBotSession, TEXT_CAPABILITIES, type QqSessionOptions } from "./session";
-import { validateInboundMessage, type QqRuntimeConfig, type QqInboundMessageV1, type QqSendRequestV1 } from "../contract";
+import { validateInboundMessage, type QqRuntimeConfig, type QqInboundMessageV1, type QqSendRequestV1, type QqMedia } from "../contract";
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -223,13 +224,142 @@ function napcatFake(hook?: (action: Action, socket: WebSocket) => boolean) {
   };
 }
 
-async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolean, controls: Pick<QqSessionOptions, "normalizationBudgetMs" | "actionTimeoutMs"> = {}) {
+async function mediaFixture(hook?: (action: Action, socket: WebSocket) => boolean, controls: Pick<QqSessionOptions, "normalizationBudgetMs" | "actionTimeoutMs" | "sendBudgetMs" | "sendDelayMs"> = {}) {
   const f = await fixture(napcatFake(hook), "10001", undefined, { mediaTransfer: "chunked-v1", ...controls });
   await vi.waitFor(() => expect(f.session.getCapabilities().backend.napcatStream).toBe(true));
   return f;
 }
 
+function uploadPart(f: Awaited<ReturnType<typeof mediaFixture>>, request: QqSendRequestV1, metadata: Omit<QqMedia, "mediaId">): QqMedia {
+  const bytes = Buffer.from("isolated caption fixture");
+  const media = { ...metadata, size: bytes.length };
+  const { mediaId } = f.session.mediaBeginUpload({ connectionEpoch: request.connectionEpoch, operationId: request.operationId,
+    conversation: request.conversation, media, sha256: createHash("sha256").update(bytes).digest("hex") });
+  f.session.mediaWrite({ connectionEpoch: request.connectionEpoch, mediaId, offset: 0, data: bytes.toString("base64") });
+  return { ...media, mediaId };
+}
+
 describe('NapCat media session', () => {
+  it.each(["image", "audio", "file", "video"] as const)("delivers %s caption as bounded text after the attachment and acknowledges both", async (kind) => {
+    const f = await mediaFixture(); const request = f.request();
+    request.parts = [uploadPart(f, request, { kind, caption: "媒体说明 🌸" })];
+    const result = await f.session.send(request);
+    const sends = f.actions.filter((a) => a.action === "send_private_msg");
+    expect(sends).toHaveLength(2);
+    expect(sends[0].params.message).toMatchObject([{ type: kind === "audio" ? "record" : kind }]);
+    expect(sends[1].params.message).toEqual([{ type: "text", data: { text: "媒体说明 🌸" } }]);
+    expect(result).toEqual({ operationId: request.operationId, outcome: "sent", parts: [
+      { partIndex: 0, outcome: "sent", messageId: String(f.actions.indexOf(sends[1]) + 1) },
+    ] });
+  });
+
+  it.each([undefined, "", " \n\t "])("does not add a text send for an absent/blank caption: %j", async (caption) => {
+    const f = await mediaFixture(); const request = f.request();
+    request.parts = [uploadPart(f, request, { kind: "image", ...(caption !== undefined ? { caption } : {}) })];
+    expect((await f.session.send(request)).outcome).toBe("sent");
+    expect(f.actions.filter((a) => a.action.startsWith("send_"))).toHaveLength(1);
+  });
+  it.each([false, true])("preserves mixed text/media order, Unicode caption chunks and one group reply (leading text: %s)", async (leadingText) => {
+    const f = await mediaFixture(); const request = { ...f.request(), conversation: { type: "group" as const, groupId: "20001" },
+      replyContext: { messageId: "70", mentionUserId: "10002" } };
+    const first = uploadPart(f, request, { kind: "image", caption: "🌸".repeat(1501) });
+    const second = uploadPart(f, request, { kind: "file", caption: "第二个说明", filename: "fixture.txt" });
+    request.parts = [...(leadingText ? [{ kind: "text" as const, text: "before" }] : []), first, { kind: "text", text: "between" }, second, { kind: "text", text: "after" }];
+    const result = await f.session.send(request);
+    expect(result.outcome).toBe("sent"); expect(result.parts).toHaveLength(request.parts.length);
+    const sends = f.actions.filter((a) => a.action === "send_group_msg");
+    const messages = sends.map((a) => a.params.message as { type: string; data: Record<string, unknown> }[]);
+    expect(messages[0].slice(0, 3)).toEqual([{ type: "reply", data: { id: "70" } }, { type: "at", data: { qq: "10002" } }, { type: "text", data: { text: " " } }]);
+    const bodies = messages.map((segments, index) => index ? segments : segments.slice(3));
+    expect(bodies.map((segments) => segments[0].type)).toEqual([...(leadingText ? ["text"] : []), "image", "text", "text", "text", "file", "text", "text"]);
+    expect(bodies.filter((segments) => segments[0].type === "text").map((segments) => segments[0].data.text)).toEqual([
+      ...(leadingText ? ["before"] : []), "🌸".repeat(1500), "🌸", "between", "第二个说明", "after",
+    ]);
+    expect(messages.slice(1).flat().some((segment) => ["reply", "at"].includes(segment.type))).toBe(false);
+    expect(bodies.find((segments) => segments[0].type === "file")![0].data.name).toBe("fixture.txt");
+  });
+  it("delivers the maximum contract caption without truncation and uses its final receipt", async () => {
+    const f = await mediaFixture(); const request = f.request(); const caption = "字".repeat(32768);
+    request.parts = [uploadPart(f, request, { kind: "video", caption })];
+    const result = await f.session.send(request);
+    const sends = f.actions.filter((a) => a.action.startsWith("send_"));
+    expect(sends).toHaveLength(23);
+    const chunks = sends.slice(1).map((a) => (a.params.message as { data: { text: string } }[])[0].data.text);
+    expect(chunks.every((text) => Array.from(text).length <= 1500)).toBe(true);
+    expect(chunks.join("")).toBe(caption);
+    expect(result.parts).toEqual([{ partIndex: 0, outcome: "sent", messageId: String(f.actions.indexOf(sends.at(-1)!) + 1) }]);
+  });
+  it.each(["rejected", "timeout", "invalid-receipt", "disconnected"] as const)("never acknowledges a partially sent media caption after %s", async (failure) => {
+    let sends = 0;
+    const f = await mediaFixture((action, socket) => {
+      if (!action.action.startsWith("send_") || ++sends !== 3) return false;
+      if (failure === "rejected") socket.send(JSON.stringify({ status: "failed", retcode: 1, echo: action.echo, data: null }));
+      else if (failure === "invalid-receipt") socket.send(JSON.stringify({ status: "ok", retcode: 0, echo: action.echo, data: { message_id: {} } }));
+      else if (failure === "disconnected") socket.close();
+      return true;
+    });
+    const request = f.request(); const media = uploadPart(f, request, { kind: "image", caption: "字".repeat(4501) });
+    request.parts = [media];
+    const result = await f.session.send(request);
+    expect(result).toEqual({ operationId: request.operationId, outcome: "unknown", parts: [{ partIndex: 0, outcome: "unknown",
+      errorCode: failure === "invalid-receipt" ? "internal" : failure }] });
+    expect(sends).toBe(3); // Attachment + first caption confirmed; stop at the next failed fragment.
+    expect((await f.session.send(request)).outcome).toBe("failed"); expect(sends).toBe(3);
+    expect(() => f.session.mediaWrite({ connectionEpoch: 1, mediaId: media.mediaId, offset: 0, data: Buffer.from("x").toString("base64") })).toThrow();
+  });
+  it("reports unknown when the first caption is rejected after its attachment was confirmed, while preserving other text parts", async () => {
+    let sends = 0;
+    const f = await mediaFixture((action, socket) => {
+      if (!action.action.startsWith("send_") || ++sends !== 2) return false;
+      socket.send(JSON.stringify({ status: "failed", retcode: 1, echo: action.echo, data: null })); return true;
+    });
+    const request = f.request(); request.parts = [uploadPart(f, request, { kind: "file", caption: "not delivered" }), { kind: "text", text: "still sent" }];
+    const result = await f.session.send(request);
+    expect(result).toMatchObject({ outcome: "unknown", parts: [{ outcome: "unknown", errorCode: "rejected" }, { outcome: "sent" }] });
+    expect(sends).toBe(3);
+  });
+  it("reports an explicit attachment rejection as partial and never sends its caption or repeats the group prefix", async () => {
+    let sends = 0;
+    const f = await mediaFixture((action, socket) => {
+      if (!action.action.startsWith("send_") || ++sends !== 1) return false;
+      socket.send(JSON.stringify({ status: "failed", retcode: 1, echo: action.echo, data: null })); return true;
+    });
+    const request = { ...f.request(), conversation: { type: "group" as const, groupId: "20001" }, replyContext: { messageId: "70", mentionUserId: "10002" } };
+    request.parts = [uploadPart(f, request, { kind: "image", caption: "must not send" }), { kind: "text", text: "independent" }];
+    expect(await f.session.send(request)).toMatchObject({ outcome: "partial", parts: [{ outcome: "failed", errorCode: "rejected" }, { outcome: "sent" }] });
+    const actions = f.actions.filter((a) => a.action === "send_group_msg");
+    expect(actions).toHaveLength(2);
+    expect(actions[0].params.message).toMatchObject([{ type: "reply" }, { type: "at" }, { type: "text" }, { type: "image" }]);
+    expect(actions[1].params.message).toEqual([{ type: "text", data: { text: "independent" } }]);
+  });
+  it("does not send caption after an invalid attachment receipt", async () => {
+    const f = await mediaFixture((action, socket) => {
+      if (!action.action.startsWith("send_")) return false;
+      socket.send(JSON.stringify({ status: "ok", retcode: 0, echo: action.echo, data: {} })); return true;
+    });
+    const request = f.request(); request.parts = [uploadPart(f, request, { kind: "audio", caption: "not confirmed" })];
+    expect(await f.session.send(request)).toMatchObject({ outcome: "unknown", parts: [{ outcome: "unknown", errorCode: "internal" }] });
+    expect(f.actions.filter((a) => a.action.startsWith("send_"))).toHaveLength(1);
+  });
+  it("rejects a changed caption binding before upload and preserves the first reply for the next text", async () => {
+    const f = await mediaFixture(); const request = { ...f.request(), conversation: { type: "group" as const, groupId: "20001" }, replyContext: { messageId: "70", mentionUserId: "10002" } };
+    const media = uploadPart(f, request, { kind: "image", caption: "authorized" });
+    const initialUploads = f.actions.filter((a) => a.action === "upload_file_stream").length;
+    request.parts = [{ ...media, caption: "changed" }, { kind: "text", text: "independent" }];
+    expect(await f.session.send(request)).toMatchObject({ outcome: "partial", parts: [{ outcome: "failed", errorCode: "rejected" }, { outcome: "sent" }] });
+    expect(f.actions.filter((a) => a.action === "upload_file_stream")).toHaveLength(initialUploads);
+    const sends = f.actions.filter((a) => a.action === "send_group_msg"); expect(sends).toHaveLength(1);
+    expect(sends[0].params.message).toMatchObject([{ type: "reply" }, { type: "at" }, { type: "text" }, { type: "text", data: { text: "independent" } }]);
+    expect(() => f.session.mediaWrite({ connectionEpoch: 1, mediaId: media.mediaId, offset: 0, data: Buffer.from("x").toString("base64") })).toThrow();
+  });
+  it("applies one send budget across attachment, caption fragments and following parts", async () => {
+    const f = await mediaFixture(undefined, { sendBudgetMs: 100, sendDelayMs: 1000, actionTimeoutMs: 1000 });
+    const request = f.request(); request.parts = [uploadPart(f, request, { kind: "video", caption: "字".repeat(3001) }), { kind: "text", text: "after budget" }];
+    expect(await f.session.send(request)).toMatchObject({ outcome: "unknown", parts: [
+      { outcome: "unknown", errorCode: "timeout" }, { outcome: "failed", errorCode: "timeout" },
+    ] });
+    expect(f.actions.filter((a) => a.action.startsWith("send_"))).toHaveLength(1);
+  });
   it('bounds failed download attempts and lets the next queued text message through', async () => {
     const f = await mediaFixture((action, socket) => {
       if (!action.action.startsWith('download_file_')) return false;

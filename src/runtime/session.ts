@@ -231,11 +231,11 @@ export class QqOneBotSession {
   }
   private async sendNow(request: QqSendRequestV1, client: OneBotActionClient, generation: number, deadline: number): Promise<QqSendResultV1> {
     const results: QqPartResult[] = [];
-    let firstPayload = true;
+    const firstPayload = { pending: true };
     for (const [partIndex, part] of request.parts.entries()) {
       if (part.kind !== "text") {
         const result = await this.sendMedia(request, part, partIndex, client, generation, deadline, firstPayload);
-        results.push(result); if (result.outcome !== "failed") firstPayload = false; continue;
+        results.push(result); continue;
       }
       const chunks = splitQqText(part.text);
       if (!chunks.length) { results.push({ partIndex, outcome: "failed", errorCode: "rejected" }); continue; }
@@ -251,12 +251,12 @@ export class QqOneBotSession {
           failed = { partIndex, outcome: sent ? "unknown" : "failed", errorCode: "disconnected" }; break;
         }
         const segments: OneBotSegment[] = [{ type: "text", data: { text } }];
-        if (firstPayload && request.conversation.type === "group" && request.replyContext) {
+        if (firstPayload.pending && request.conversation.type === "group" && request.replyContext) {
           segments.unshift({ type: "reply", data: { id: request.replyContext.messageId } });
           if (request.replyContext.mentionUserId) segments.splice(1, 0,
             { type: "at", data: { qq: request.replyContext.mentionUserId } }, { type: "text", data: { text: " " } });
         }
-        firstPayload = false;
+        firstPayload.pending = false;
         try {
           const response = await client.call<{ message_id?: unknown }>(request.conversation.type === "group" ? "send_group_msg" : "send_private_msg", {
             [request.conversation.type === "group" ? "group_id" : "user_id"]: request.conversation.type === "group" ? request.conversation.groupId : request.conversation.peerId,
@@ -284,13 +284,15 @@ export class QqOneBotSession {
     }
     return this.result(request, results);
   }
-  private async sendMedia(request: QqSendRequestV1, part: QqSendRequestV1["parts"][number], partIndex: number, client: OneBotActionClient, generation: number, deadline: number, firstPayload: boolean): Promise<QqPartResult> {
+  private async sendMedia(request: QqSendRequestV1, part: QqSendRequestV1["parts"][number], partIndex: number, client: OneBotActionClient, generation: number, deadline: number, firstPayload: { pending: boolean }): Promise<QqPartResult> {
     if (part.kind === "text" || part.kind === "card" || !this.capabilities.messages[part.kind]) return { partIndex, outcome: "failed", errorCode: "unsupported" };
     const check = () => {
+      if (!this.running || request.connectionEpoch !== this.connectionEpoch || this.client !== client || this.server.client !== client || generation !== this.generation) throw new OneBotTransportError("disconnected");
       this.checkMediaEpoch(request.connectionEpoch);
-      if (this.client !== client || generation !== this.generation || performance.now() >= deadline) throw new Error("Stale media send");
+      if (deadline - performance.now() < 1) throw new OneBotTransportError("timeout");
     };
     let dispatched = false;
+    let sent = 0;
     try {
       check();
       const source = this.spool.claim(request, part);
@@ -300,22 +302,39 @@ export class QqOneBotSession {
       const path = await uploadMedia(client, source, check, deadline, extension);
       check();
       const type = part.kind === "audio" ? "record" : part.kind === "sticker" ? "image" : part.kind;
-      const segments: OneBotSegment[] = [{ type, data: { file: path, ...(part.kind === "file" && part.filename ? { name: part.filename } : {}) } }];
-      if (firstPayload && request.conversation.type === "group" && request.replyContext) {
-        segments.unshift({ type: "reply", data: { id: request.replyContext.messageId } });
-        if (request.replyContext.mentionUserId) segments.splice(1, 0, { type: "at", data: { qq: request.replyContext.mentionUserId } }, { type: "text", data: { text: " " } });
+      // Keep the attachment a standalone payload (not all media kinds support
+      // mixed segments), then send its caption using the normal text bounds.
+      const payloads: OneBotSegment[][] = [
+        [{ type, data: { file: path, ...(part.kind === "file" && part.filename ? { name: part.filename } : {}) } }],
+        ...splitQqText(part.caption ?? "").map((text) => [{ type: "text", data: { text } }]),
+      ];
+      let lastMessageId: string | undefined;
+      for (const [index, segments] of payloads.entries()) {
+        check();
+        if (firstPayload.pending && request.conversation.type === "group" && request.replyContext) {
+          segments.unshift({ type: "reply", data: { id: request.replyContext.messageId } });
+          if (request.replyContext.mentionUserId) segments.splice(1, 0, { type: "at", data: { qq: request.replyContext.mentionUserId } }, { type: "text", data: { text: " " } });
+        }
+        firstPayload.pending = false;
+        dispatched = true;
+        const response = await client.call<{ message_id?: unknown }>(request.conversation.type === "group" ? "send_group_msg" : "send_private_msg", {
+          [request.conversation.type === "group" ? "group_id" : "user_id"]: request.conversation.type === "group" ? request.conversation.groupId : request.conversation.peerId,
+          message: segments,
+        }, Math.min(this.options.actionTimeoutMs ?? 30_000, Math.max(1, deadline - performance.now())));
+        const id = response && oneBotId(response.message_id);
+        if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return { partIndex, outcome: "unknown", errorCode: "internal" };
+        sent++;
+        dispatched = false;
+        lastMessageId = id;
+        if (index < payloads.length - 1) {
+          const delay = Math.min(this.options.sendDelayMs ?? 500, Math.max(0, deadline - performance.now()));
+          if (delay > 0) await new Promise((resolve) => setTimeout(resolve, Math.ceil(delay)));
+        }
       }
-      dispatched = true;
-      const response = await client.call<{ message_id?: unknown }>(request.conversation.type === "group" ? "send_group_msg" : "send_private_msg", {
-        [request.conversation.type === "group" ? "group_id" : "user_id"]: request.conversation.type === "group" ? request.conversation.groupId : request.conversation.peerId,
-        message: segments,
-      }, Math.min(this.options.actionTimeoutMs ?? 30_000, Math.max(1, deadline - performance.now())));
-      const id = response && oneBotId(response.message_id);
-      if (!id || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return { partIndex, outcome: "unknown", errorCode: "internal" };
-      return { partIndex, outcome: "sent", messageId: id };
+      return { partIndex, outcome: "sent", messageId: lastMessageId! };
     } catch (error) {
       const known = error instanceof OneBotActionError || error instanceof OneBotTransportError && ["unavailable", "overloaded"].includes(error.code);
-      return { partIndex, outcome: dispatched && !known ? "unknown" : "failed", errorCode: error instanceof OneBotTransportError && error.code === "timeout" ? "timeout" : "rejected" };
+      return { partIndex, outcome: sent || dispatched && !known ? "unknown" : "failed", errorCode: error instanceof OneBotTransportError && error.code === "timeout" ? "timeout" : error instanceof OneBotTransportError && error.code === "disconnected" ? "disconnected" : "rejected" };
     } finally { try { this.spool.release(request.connectionEpoch, part.mediaId); } catch { /* already revoked */ } }
   }
   private result(request: QqSendRequestV1, parts: QqPartResult[]): QqSendResultV1 {
