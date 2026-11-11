@@ -40,6 +40,36 @@ describe("OneBotActionClient", () => {
     await expect(pending).rejects.toBeInstanceOf(OneBotActionError);
   });
 
+  it.each([
+    { wording: "backend wording", message: "backend message", expected: "backend wording" },
+    { wording: "backend wording", message: { toString: null }, expected: "backend wording" },
+    { wording: "", message: "backend message", expected: "backend message" },
+    { wording: "", message: "", expected: "OneBot action failed (1404)" },
+    { wording: { toString: null }, message: "backend message", expected: "backend message" },
+    ...[undefined, null, true, 42, [], {}, { toString: null }, [{ toString: null }]].map((value) => ({
+      wording: value, message: value, expected: "OneBot action failed (1404)",
+    })),
+  ])("safely rejects single and stream errors with untrusted text: %j", async ({ wording, message, expected }) => {
+    for (const stream of [false, true]) for (const [status, retcode] of [["failed", 0], ["failed", 1404], ["ok", 1404]] as const) {
+      const socket = new FakeSocket();
+      const client = new OneBotActionClient(socket as unknown as WebSocket, 20, 20);
+      const pending = stream ? client.callStream("bad", {}, () => undefined) : client.call("bad");
+      // Install a handler before dispatch, as a real handshake/send caller does.
+      const result = pending.catch((error: unknown) => error);
+      const { echo } = requestAt(socket, 0);
+      const response = JSON.parse(JSON.stringify({ status, retcode, echo, wording, message }));
+      expect(() => expect(client.handleResponse(response)).toBe(true)).not.toThrow();
+      expect(client.pendingCount).toBe(0);
+      expect(await result).toMatchObject({ name: "OneBotActionError", message: expected.replace("(1404)", `(${retcode})`), retcode });
+      expect(await result).toBeInstanceOf(OneBotActionError);
+      expect(client.handleResponse(response)).toBe(false);
+
+      const healthy = client.call("healthy");
+      client.handleResponse({ status: "ok", retcode: 0, echo: requestAt(socket, 1).echo, data: "alive" });
+      await expect(healthy).resolves.toBe("alive");
+    }
+  });
+
   it("waits for asynchronous stream packet handlers before resolving", async () => {
     const socket = new FakeSocket();
     const client = new OneBotActionClient(socket as unknown as WebSocket);

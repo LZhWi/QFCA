@@ -136,6 +136,45 @@ describe("OneBotReverseWsServer", () => {
     // Another authenticated peer can still connect after the malformed frame.
     const healthy = await connect(info.url); healthy.terminate();
   });
+  it("closes a malformed failed handshake without crashing and accepts a fresh backend", async () => {
+    const diagnostic = vi.fn();
+    const value = server({ onError: diagnostic, onClientConnected: async (client) => { await client.call("get_login_info"); } });
+    const info = await value.start();
+    const malformed = new WebSocket(info.url, { headers: { "X-Self-ID": "10001", Authorization: "Bearer token" } });
+    const closed = new Promise<number>((resolve, reject) => { malformed.once("close", resolve); malformed.once("error", reject); });
+    malformed.on("message", (raw) => {
+      const { echo } = JSON.parse(raw.toString());
+      malformed.send(JSON.stringify({ echo, status: "failed", retcode: 1404, wording: { toString: null } }));
+    });
+    expect(await closed).toBe(4002);
+    expect(diagnostic).toHaveBeenCalledWith("handshake");
+    const healthy = new WebSocket(info.url, { headers: { "X-Self-ID": "10001", Authorization: "Bearer token" } });
+    healthy.on("message", (raw) => {
+      const { echo } = JSON.parse(raw.toString());
+      healthy.send(JSON.stringify({ echo, status: "ok", retcode: 0, data: { user_id: 10001 } }));
+    });
+    await new Promise<void>((resolve, reject) => { healthy.once("open", resolve); healthy.once("error", reject); });
+    await vi.waitFor(() => expect(value.client?.pendingCount).toBe(0));
+    expect(diagnostic).toHaveBeenCalledTimes(1);
+    healthy.terminate();
+  });
+  it("settles malformed backend failures and keeps the same connection usable", async () => {
+    const value = server(); const info = await value.start();
+    const backend = await connect(info.url);
+    backend.on("message", (raw) => {
+      const { echo, action } = JSON.parse(raw.toString());
+      backend.send(JSON.stringify(action === "bad"
+        ? { echo, status: "failed", retcode: 1404, wording: [{ toString: null }], message: { toString: null } }
+        : { echo, status: "ok", retcode: 0, data: "alive" }));
+    });
+    await vi.waitFor(() => expect(value.client).not.toBeNull());
+    const client = value.client!;
+    await expect(client.call("bad")).rejects.toMatchObject({ name: "OneBotActionError", retcode: 1404 });
+    expect(client.pendingCount).toBe(0);
+    await expect(client.call("healthy")).resolves.toBe("alive");
+    expect(value.client).toBe(client);
+    backend.terminate();
+  });
   it("rejects oversized frames before JSON parsing and enforces heartbeat cleanup", async () => {
     const value = server({ heartbeatTimeoutMs: 30 }); const info = await value.start();
     const oversized = await connect(info.url);
