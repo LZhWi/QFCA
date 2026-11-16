@@ -52,6 +52,7 @@ export class QqOneBotSession {
   private operations = new Set<string>();
   private readonly spool = new MediaSpool();
   private capabilities = structuredClone(TEXT_CAPABILITIES);
+  private mediaProbe: Promise<void> | null = null;
 
   constructor(private readonly options: QqSessionOptions) {
     if (!validateRuntimeConfig(options.config) || !Number.isSafeInteger(options.runtimeEpoch) || options.runtimeEpoch < 0) {
@@ -71,6 +72,7 @@ export class QqOneBotSession {
       ...this.config.listen, accessToken: options.accessToken, expectedSelfId: this.config.expectedSelfId,
       actionTimeoutMs: options.actionTimeoutMs,
       onClientConnected: async (client, selfId) => {
+        this.mediaProbe = null;
         this.spool.revoke();
         this.capabilities = structuredClone(TEXT_CAPABILITIES);
         this.options.onCapabilities?.(this.capabilities);
@@ -82,13 +84,13 @@ export class QqOneBotSession {
         this.connectionEpoch++;
         const epoch = this.connectionEpoch;
         const check = () => { if (!this.running || generation !== this.generation || this.server.client !== client || epoch !== this.connectionEpoch) throw new Error("Stale media connection"); };
-        this.setStatus({ phase: "running", selfId, connectionEpoch: epoch });
         // Text becomes ready without waiting for optional extensions. An old probe
         // must not overwrite capabilities after stop or a newer connection.
-        if (this.options.mediaTransfer === "chunked-v1") void probeMedia(client, TEXT_CAPABILITIES, check).then((capabilities) => {
+        if (this.options.mediaTransfer === "chunked-v1") this.mediaProbe = probeMedia(client, TEXT_CAPABILITIES, check).then((capabilities) => {
           check(); this.capabilities = capabilities;
           this.options.onCapabilities?.(structuredClone(capabilities));
         }).catch(() => undefined);
+        this.setStatus({ phase: "running", selfId, connectionEpoch: epoch });
       },
       onClientDisconnected: () => { this.spool.revoke(); this.capabilities = structuredClone(TEXT_CAPABILITIES); this.options.onCapabilities?.(structuredClone(this.capabilities)); this.client = null; this.setStatus({ phase: "waiting-backend" }); },
       onEvent: (event, client) => this.receive(event, client),
@@ -146,7 +148,14 @@ export class QqOneBotSession {
     if (!isQqEventAllowed(value, this.config, this.config.expectedSelfId)) return Promise.resolve();
     const epoch = this.connectionEpoch;
     const generation = this.generation;
+    // Probe is bounded to 10 seconds and the server bounds pending events to 64.
+    // Preserve early attachments instead of permanently normalizing them as
+    // unsupported. Capture this connection's probe, never a replacement's.
+    const mediaProbe = this.mediaProbe;
+    const hasMedia = value.message.some((segment) => segment &&
+      ["image", "mface", "record", "file", "video"].includes(segment.type));
     const next = this.receiveChain.then(async () => {
+      if (hasMedia && mediaProbe) await mediaProbe;
       if (!this.accepting || generation !== this.generation || this.client !== client || this.server.client !== client) return;
       const now = Date.now();
       for (const [id, expires] of this.seen) if (expires <= now) this.seen.delete(id);
