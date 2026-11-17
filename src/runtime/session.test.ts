@@ -640,3 +640,92 @@ it('quiesce during second download releases earlier and partial handles', async 
  const reserved = Array.from({length:256},(_,i) => f.session.mediaBeginUpload({connectionEpoch:1,operationId:`qa_${i}`,conversation:{type:'private',peerId:'10002'},media:{kind:'file',size:1},sha256:'0'.repeat(64)}));
  for(const r of reserved) f.session.mediaRelease({connectionEpoch:1,...r});
 });
+
+describe('media readiness window', () => {
+  const mediaMessage = (f: Awaited<ReturnType<typeof fixture>>, id = 6001) => f.message({ message_id: id,
+    message: [{ type: 'text', data: { text: 'caption' } }, { type: 'image', data: { file: 'early-image' } }] });
+  function delayedProbe() {
+    const pending: (() => void)[] = [];
+    const backend = napcatFake();
+    return { pending, respond: (action: Action, socket: WebSocket) => {
+      if (action.action === 'get_version_info') {
+        pending.push(() => { if (socket.readyState === WebSocket.OPEN) backend(action, socket); });
+        return true;
+      }
+      return backend(action, socket);
+    } };
+  }
+  it('delivers text immediately and waits for the connection probe before normalizing early media', async () => {
+    const probe = delayedProbe();
+    const f = await fixture(probe.respond, '10001', undefined, { mediaTransfer: 'chunked-v1' });
+    expect(f.session.getCapabilities().messages.image).toBe(false);
+    f.socket.send(JSON.stringify(f.message()));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    f.socket.send(JSON.stringify(mediaMessage(f)));
+    f.socket.send(JSON.stringify(mediaMessage(f)));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(f.inbound).toHaveLength(1);
+    probe.pending[0]();
+    f.socket.send(JSON.stringify(f.message({ message_id: 6002 })));
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(3));
+    expect(f.inbound[1].text).toBe('caption');
+    expect(f.inbound[1].attachments).toHaveLength(1);
+    expect(f.actions.filter(a => a.action.startsWith('download_file_'))).toHaveLength(1);
+  });
+  it('does not deliver old queued media on a replacement connection', async () => {
+    const probe = delayedProbe();
+    const f = await fixture(probe.respond, '10001', undefined, { mediaTransfer: 'chunked-v1' });
+    f.socket.send(JSON.stringify(mediaMessage(f)));
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const replacement = await f.connect();
+    await vi.waitFor(() => expect(f.session.getStatus()).toMatchObject({ connectionEpoch: 2 }));
+    replacement.send(JSON.stringify(mediaMessage(f, 6002)));
+    await vi.waitFor(() => expect(probe.pending).toHaveLength(2));
+    probe.pending[0](); probe.pending[1]();
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(1));
+    expect(f.inbound[0].backendMessageId).toBe('6002');
+    expect(f.inbound[0].connectionEpoch).toBe(2);
+    expect(f.inbound[0].attachments).toHaveLength(1);
+  });
+  it.each(['stop', 'quiesce'] as const)('invalidates pending media after %s', async action => {
+    const probe = delayedProbe();
+    const f = await fixture(probe.respond, '10001', undefined, { mediaTransfer: 'chunked-v1' });
+    f.socket.send(JSON.stringify(mediaMessage(f)));
+    await new Promise(resolve => setTimeout(resolve, 30));
+    await f.session[action]();
+    probe.pending[0]();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(f.inbound).toHaveLength(0);
+    expect(f.actions.some(a => a.action.startsWith('download_file_'))).toBe(false);
+  });
+  it('falls back to text when the probe establishes unsupported media and drains subsequent events', async () => {
+    let release: (() => void) | undefined;
+    const f = await fixture((a, socket) => {
+      if (a.action !== 'get_version_info') return false;
+      release = () => socket.send(JSON.stringify({ status: 'ok', retcode: 0, echo: a.echo, data: { app_name: 'other' } }));
+      return true;
+    }, '10001', undefined, { mediaTransfer: 'chunked-v1' });
+    f.socket.send(JSON.stringify(mediaMessage(f)));
+    f.socket.send(JSON.stringify(f.message({ message_id: 6002 })));
+    await vi.waitFor(() => expect(release).toBeDefined());
+    release!();
+    await vi.waitFor(() => expect(f.inbound).toHaveLength(2));
+    expect(f.inbound[0].text).toContain('caption');
+    expect(f.inbound[0].attachments).toBeUndefined();
+    expect(f.inbound[1].backendMessageId).toBe('6002');
+  });
+});
+
+it('drains early media and following text after the bounded probe timeout', async () => {
+  const f = await fixture(a => a.action === 'get_version_info', '10001', undefined,
+    { mediaTransfer: 'chunked-v1' });
+  f.socket.send(JSON.stringify(f.message({ message: [
+    { type: 'text', data: { text: 'timeout caption' } }, { type: 'image', data: { file: 'early' } },
+  ] })));
+  f.socket.send(JSON.stringify(f.message({ message_id: 6002 })));
+  await vi.waitFor(() => expect(f.inbound).toHaveLength(2), { timeout: 12000 });
+  expect(f.inbound[0].text).toContain('timeout caption');
+  expect(f.inbound[0].attachments).toBeUndefined();
+  expect(f.inbound[1].backendMessageId).toBe('6002');
+  expect(f.actions.some(a => a.action.startsWith('download_file_'))).toBe(false);
+}, 15000);
